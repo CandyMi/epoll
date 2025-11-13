@@ -1,43 +1,43 @@
-# wepoll
+# epoll
 
+  A project that uses `iocp` and `select` to simulate the ABI of `epoll`.
 
-# Demo
+  So, Let's use `epoll` in every where. ：）
 
-```c
-#include "uepoll.h"
-#include "sys/event.h"
-#include "stdio.h"
-#include "unistd.h"
+# Support Platform
 
-int main(int argc, char const *argv[])
-{
-  HANDLE efd = epoll_create(0);
-  printf("efd = %ld\n", efd);
-  struct epoll_event revent = { 
-    .data.fd = 1024,
-    .events = EPOLLIN | EPOLLONESHOT,
-  };
-  epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &revent);
-  // struct epoll_event wevent = { 
-  //   .data.fd = 1024,
-  //   .events = EPOLLOUT,
-  // };
-  // epoll_ctl(efd, EPOLL_CTL_ADD, STDOUT_FILENO, &wevent);
-  struct epoll_event events[10];
-  while (1)
-  {
-    int r = epoll_wait(efd, events, 10, -1);
-    if (r > 0)
-    {
-      char buf[1024]; memset(buf, 0, 1024);
-      int len = read(STDOUT_FILENO, buf, 1024);
-      printf("nevents = %d, event{.fd = %d, .events = %d}, data = ['%s']}\n", r, events[0].data.fd, events[0].events, buf);
-      // event.data.fd++; event.events = EPOLLIN | EPOLLONESHOT;
-      // epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &event);
-    }
-    printf("ret = %d, out\n", r);
-  }
+  * Windows (wepoll)
+  * Linux
+  * MacOS
+  * FreeBSD
+  * Other Posix
 
-  return 0;
-}
-```
+# Support C Compiler
+
+  * MSVC
+  * GCC
+  * CLANG
+
+# Feature
+
+  * Thread-Safe.
+  * ABI Compatible.
+  * Multi-Platform Supported.
+  * `block` and `nonblock` Supported.
+  * `fd` can `Insert` and `Remove` in anytime.
+
+# Limit
+
+  * `EPOLLET` is never supported.
+  * `wepoll` just supported `SOCKET`/`Pipe`.
+  * `FD_SETSIZE` was limit the maximum number of fd.
+
+# How to use it ?
+
+  1. Copy all files to your project directory.
+  2. Just include `"epoll.h"` file in your codes.
+  3. Fine. Let's coding.
+
+# License
+
+  MIT
