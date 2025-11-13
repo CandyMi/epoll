@@ -83,7 +83,7 @@ int main(int argc, char const *argv[])
         r = epoll_wait(efd, events, 1024, -1);
         printf("r = %d", r);
         if (r > 0) {
-            printf(", len = %d\n", read(STDIN_FILENO, buf, 16));
+            printf(", len = %d\n", (int)read(STDIN_FILENO, buf, 16));
         } else {
             printf("\n");
         }
