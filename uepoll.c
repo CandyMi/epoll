@@ -17,7 +17,7 @@
   #define FD_COPY(f, t)  memcpy(t, f, sizeof(*f));
 #endif
 
-#define EPOLL_NO_THREADS 1
+// #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
   /* 如果假设不会有多线程的情况, 则不需要任何逻辑保证线程安全 */
   #define uepoll_use_spinlock -1
@@ -343,19 +343,26 @@ HANDLE epoll_create1(int flags)
 {
 #if uepoll_use_spinlock == 0
   if (!phandle) {
-    for(int i = 0; pthread_names[i];) {
-      phandle = dlopen(pthread_names[i], RTLD_NOW);
-      if (phandle) break;
+    thread_mutex_init = dlsym(RTLD_DEFAULT, "pthread_mutex_init");
+    thread_mutex_lock = dlsym(RTLD_DEFAULT, "pthread_mutex_lock");
+    thread_mutex_unlock = dlsym(RTLD_DEFAULT, "pthread_mutex_unlock");
+    if (!thread_mutex_init || !thread_mutex_lock || !thread_mutex_unlock)
+    {
+      for(int i = 0; pthread_names[i]; i++) {
+        phandle = dlopen(pthread_names[i], RTLD_NOW);
+        if (phandle) break;
+        // printf("path = [%s] not found.\n", pthread_names[i]);
+      }
+      if (!phandle) {
+        errno = ENOMEM;
+        return EPOLL_INVALID;
+      }
+      thread_mutex_init = dlsym(phandle, "pthread_mutex_init");
+      thread_mutex_lock = dlsym(phandle, "pthread_mutex_lock");
+      thread_mutex_unlock = dlsym(phandle, "pthread_mutex_unlock");
+    } else {
+      phandle = RTLD_DEFAULT;
     }
-    if (!phandle) {
-      errno = ENOMEM;
-      return EPOLL_INVALID;
-    }
-    typedef void (*thread_mutex_init_t) (pthread_mutex_t*, const pthread_mutexattr_t *);
-    typedef void (*thread_mutex_lock_t) (pthread_mutex_t*);
-    thread_mutex_init = dlsym(phandle, "pthread_mutex_init");
-    thread_mutex_lock = dlsym(phandle, "pthread_mutex_lock");
-    thread_mutex_unlock = dlsym(phandle, "pthread_mutex_unlock");
   }
 #endif
   errno = 0;
