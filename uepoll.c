@@ -422,11 +422,12 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   epoll_spinlock_lock(&ep->lock);
   epoll_receive(ep); /* 每次监听前必须重置状态（多一次系统调用） */
   fd_set rset, wset, eset; /* 使用复制拷贝来解决多线程竞争的问题 */
+  int nfds = ep->nfds;
   FD_COPY(&ep->rset, &rset); FD_COPY(&ep->wset, &wset); FD_COPY(&ep->eset, &eset);
   epoll_spinlock_unlock(&ep->lock);
 
   int nevents = 0; SOCKET fd = 0; struct epoll_event* ev;
-  int r = select(ep->nfds, &rset, &wset, &eset, tp);
+  int r = select(nfds, &rset, &wset, &eset, tp);
   if (r > 0)
   { // select 返回的是事件数量, 不是文件描述符的数量.
     if (FD_ISSET(ep->pipes[0], &rset)) {
@@ -441,10 +442,10 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
       }
       return epoll_wait(efd, events, maxevents, timeout);
     }
-    // printf("r = %d, nfds = %d\n", r, ep->nfds);
+    // printf("r = %d, nfds = %d\n", r, nfds);
     /* 检查`fd`是否被设置 */
     epoll_spinlock_lock(&ep->lock);
-    for (SOCKET fd = 0; fd < ep->nfds; fd++)
+    for (SOCKET fd = 0; fd < nfds; fd++)
     {
       if (uepoll_has_fd(ep, fd))
       {
