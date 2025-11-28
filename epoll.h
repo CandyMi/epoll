@@ -1,7 +1,8 @@
 #ifndef _EPOLL_H_
 #define _EPOLL_H_
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__ANDROID__)
+  #define NO_NATIVE_EPOLL 1
   #include <sys/epoll.h>
   #include <unistd.h>
   typedef int HANDLE;
