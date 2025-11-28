@@ -6,7 +6,7 @@
 #define __UEPOLL_H__
 
 #ifndef UEPOLL_EXPORT
-#define UEPOLL_EXPORT __attribute__((visibility("default")))
+    #define UEPOLL_EXPORT __attribute__((visibility("default")))
 #endif
 
 #include <stdint.h>
@@ -15,7 +15,7 @@
 #include <stdbool.h>
 
 #ifndef NO_NATIVE_EPOLL
- #define NO_NATIVE_EPOLL 1
+    #define NO_NATIVE_EPOLL 1
 #endif
 
 typedef intptr_t HANDLE;
