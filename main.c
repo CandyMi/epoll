@@ -8,6 +8,7 @@
     #define read _read
 #endif
 
+#include <assert.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,73 +22,78 @@
     #include <sys/time.h>
 #endif
 
-#ifndef STDIN_FILENO
-    #define STDIN_FILENO 0 // wepoll 不兼容, 因为只支持socket
+#define EPOLL_TEST_FUNCTION(fname, code)    \
+static void fname() { code; printf(         \
+"%02d. test case : '%s' successed.\n",++i, __FUNCTION__); }
+
+static int i = 0;
+
+static inline
+int64_t time_now()
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000000 + tv.tv_usec;
+}
+
+EPOLL_TEST_FUNCTION(testcase_epoll_watch, {
+#ifndef WIN32
+    char sendbuf[] = "123";
+    HANDLE efd = epoll_create(0);
+    assert(efd > 0); int r;
+    int fds[2]; pipe(fds);
+    int RPIPE = fds[0];
+    int WPIPE = fds[1];
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = RPIPE;
+    r = epoll_ctl(efd, EPOLL_CTL_ADD, RPIPE, &ev);
+    assert(r == 0);
+    struct epoll_event event[1];
+    r = write(WPIPE, sendbuf, strlen(sendbuf));
+    assert(r = strlen(sendbuf));
+    r = epoll_wait(efd, event, 1, 10);
+    assert(r = 1);
+    assert(event[0].data.fd == RPIPE);
+    assert(event[0].events == EPOLLIN);
+    char *buf = malloc(strlen(sendbuf));
+    r = read(RPIPE, buf, 128);
+    assert(r == strlen(sendbuf));
+    free(buf); epoll_close(efd);
 #endif
+});
 
-// static inline
-// void test_time1(size_t count)
-// {
-//     struct timespec now; uint64_t t;
-//     for (size_t i = 0; i < count; i++)
-//     {
-//         clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
-//         t = now.tv_sec * 1000 + now.tv_nsec / 1000000;
-//     }
-// }
+EPOLL_TEST_FUNCTION(testcase_epoll_alloc, 
+{
+    for (int i = 0; i < 100000; i++)
+    {
+        HANDLE efd = epoll_create(0);
+        assert(efd > 0);
+        epoll_close(efd);
+    }
+});
 
-// static inline
-// void test_time2(size_t count)
-// {
-//     struct timeval now; uint64_t t;
-//     for (size_t i = 0; i < count; i++)
-//     {
-//         gettimeofday(&now, NULL);
-//         t = now.tv_sec * 1000 + now.tv_usec / 1000;
-//     }
-// }
+EPOLL_TEST_FUNCTION(testcase_epoll_timer,
+{
+    HANDLE efd = epoll_create(0);
+    assert(efd > 0);
+    struct epoll_event event[1];
+    int64_t s = time_now();
+    for (size_t i = 0; i < 10; i++)
+    {
+        int r = epoll_wait(efd, event, 1, 100);
+        assert(r == 0);
+    }
+    int64_t e = time_now();
+    printf("clock diff = '%d'\n", (int)(e - s));
+    // assert(r > 0)
+    epoll_close(efd);
+})
 
 int main(int argc, char const *argv[])
 {
-    // benchmark for gettime choice 
-    // size_t t = strtol(argv[1], NULL, 10);
-    // size_t l = strtol(argv[2], NULL, 10);
-    // // printf("%zu, %zu\n", t, l);
-    // t == 0 ? test_time1(l) : test_time2(l);
-
-    int r;
-
-    /* code */
-    HANDLE efd = epoll_create(1024);
-    //printf("efd = %zd\n", efd);
-
-    struct epoll_event ev;
-    // ev.events = EPOLLHUP; ev.data.fd = STDIN_FILENO;
-    // ev.events = EPOLLIN; ev.data.fd = STDIN_FILENO;
-    ev.events = EPOLLIN | EPOLLOUT; ev.data.fd = STDIN_FILENO;
-    // ev.events = EPOLLIN | EPOLLONESHOT; ev.data.fd = STDIN_FILENO;
-    r = epoll_ctl(efd, EPOLL_CTL_ADD, STDIN_FILENO, &ev);
-    if (r) perror("ctrl add stdin failed: ");
-#ifdef WIN32
-    Sleep(1000);
-#else
-    sleep(1);
-#endif
-    // struct epoll_event events[1024];
-    // r = epoll_wait(efd, events, 1024, -1);
-    // printf("r = %zd\n", r);
-
-    while (1)
-    {
-        struct epoll_event events[1024]; char buf[16];
-        r = epoll_wait(efd, events, 1024, -1);
-        printf("r = %d", r);
-        if (r > 0) {
-            printf(", len = %d\n", (int)read(STDIN_FILENO, buf, 16));
-        } else {
-            printf("\n");
-        }
-    }
-
+    testcase_epoll_timer();
+    testcase_epoll_alloc();
+    testcase_epoll_watch();
     return 0;
 }
