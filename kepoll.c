@@ -31,7 +31,7 @@
   #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
   #define epoll_spinlock_unlock(lock)     __sync_lock_release((lock))
 #else
-  #error "Hey! Please think about why do your modern operating system unsupported atomic yet?"
+  #error "Hey! Why doesn't your compiler support atomic operations yet?"
 #endif
 
 #define EPOLL_INVALID (-1)
@@ -97,7 +97,10 @@ int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
   int events = event->events; void *udata = event->data.ptr;
   /* 虽然添加, 但是可以不启用 */
   int filter = 0; int flags = 0; int nevent = 0; 
-  int exflags = (events & EPOLLONESHOT) ? EV_ONESHOT : 0;
+  uint32_t exflags = (events & EPOLLONESHOT) ? EV_ONESHOT : 0;
+  if (events & EPOLLET) // 模拟`ET`模式
+    exflags |= EV_CLEAR;
+  // printf("events & EPOLLET = 0x%08x, flags = 0x%04x\n", events & EPOLLET, exflags);
   /* 读事件 */
   if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND)) {
     filter = EVFILT_READ; flags = EV_ADD | EV_ENABLE | exflags;
