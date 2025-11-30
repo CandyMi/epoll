@@ -14,7 +14,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-  EPOLL_EXPORT void epoll_allocator(epoll_realloc_t realloc_func_t);
+  EPOLL_EXPORT void epoll_allocator(epoll_realloc_t alloc);
   EPOLL_EXPORT int epoll_close(HANDLE efd);
 #ifdef __cplusplus
 }
