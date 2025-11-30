@@ -1,15 +1,24 @@
-#ifndef _EPOLL_H_
-#define _EPOLL_H_
+#ifndef EPOLL_H
+#define EPOLL_H
 
-#if defined(__linux__) || defined(__ANDROID__)
+#if defined(__linux__) || defined(__Android__)
   #define NO_NATIVE_EPOLL 1
+#ifndef EPOLL_EXPORT
+  #define EPOLL_EXPORT __attribute__((visibility("default")))
+#endif
   #include <sys/epoll.h>
   #include <unistd.h>
   typedef int HANDLE;
   typedef int SOCKET;
   typedef void*(*epoll_realloc_t) (void *, size_t);
-  static inline void epoll_allocator(epoll_realloc_t realloc_func_t) { (void)realloc_func_t; /* 只做兼容 */ }
-  static inline int epoll_close(int efd) { return close(efd); /* 兼容ABI */ }
+#ifdef __cplusplus
+extern "C" {
+#endif
+  EPOLL_EXPORT void epoll_allocator(epoll_realloc_t realloc_func_t);
+  EPOLL_EXPORT int epoll_close(HANDLE efd);
+#ifdef __cplusplus
+}
+#endif
 #elif defined(WIN32)
   #include "wepoll.h"
 #else
