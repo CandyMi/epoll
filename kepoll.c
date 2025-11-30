@@ -88,7 +88,7 @@ HANDLE epoll_create1(int flags)
 }
 
 static inline
-int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, bool first)
 {
   epoll_spinlock_lock(&ep->lock);
   int efd = ep->efd;
@@ -97,24 +97,25 @@ int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
   int events = event->events; void *udata = event->data.ptr;
   /* 虽然添加, 但是可以不启用 */
   int filter = 0; int flags = 0; int nevent = 0; 
+  uint32_t add = first ? EV_ADD : 0; // 首次必须是添加模式
   uint32_t exflags = (events & EPOLLONESHOT) ? EV_ONESHOT : 0;
   if (events & EPOLLET) // 模拟`ET`模式
     exflags |= EV_CLEAR;
   // printf("events & EPOLLET = 0x%08x, flags = 0x%04x\n", events & EPOLLET, exflags);
   /* 读事件 */
   if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND)) {
-    filter = EVFILT_READ; flags = EV_ADD | EV_ENABLE | exflags;
+    filter = EVFILT_READ; flags = add | EV_ENABLE | exflags;
     EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
   } else {
-    filter = EVFILT_READ; flags = EV_ADD | EV_DISABLE;
+    filter = EVFILT_READ; flags = add | EV_DISABLE;
     EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
   }
   /* 写事件 */
   if (events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) {
-    filter = EVFILT_WRITE; flags = EV_ADD | EV_ENABLE | exflags;
+    filter = EVFILT_WRITE; flags = add | EV_ENABLE | exflags;
     EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
   } else {
-    filter = EVFILT_WRITE; flags = EV_ADD | EV_DISABLE;
+    filter = EVFILT_WRITE; flags = add | EV_DISABLE;
     EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
   }
   /* 注册事件 */
@@ -122,6 +123,18 @@ int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
   // if (r) perror("kepoll_add");
   epoll_spinlock_unlock(&ep->lock);
   return r;
+}
+
+static inline
+int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+{
+  return _kepoll_register(ep, fd, event, true);
+}
+
+static inline
+int kepoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+{
+  return _kepoll_register(ep, fd, event, false);
 }
 
 static inline
@@ -139,14 +152,6 @@ int kepoll_del(struct epoll_t *ep, SOCKET fd, bool deleted)
   // if (r) perror("kepoll_del");
   errno = 0;
   epoll_spinlock_unlock(&ep->lock);
-  return 0;
-}
-
-static inline
-int kepoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
-{
-  kepoll_del(ep, fd, false);
-  kepoll_add(ep, fd, event);
   return 0;
 }
 
