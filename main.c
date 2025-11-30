@@ -11,6 +11,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 #include <stdlib.h>
 #ifndef WIN32
     #include <unistd.h>
