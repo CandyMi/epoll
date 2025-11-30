@@ -2,7 +2,7 @@
 #define EPOLL_H
 
 #if defined(__linux__) || defined(__Android__)
-  #define NO_NATIVE_EPOLL 1
+  #define NO_NATIVE_EPOLL 0
 #ifndef EPOLL_EXPORT
   #define EPOLL_EXPORT __attribute__((visibility("default")))
 #endif
