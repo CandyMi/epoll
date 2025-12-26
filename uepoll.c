@@ -32,10 +32,10 @@
   #define epoll_spinlock_init(lock)       atomic_flag_clear((lock))
   #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set((lock)) == 1)
   #define epoll_spinlock_unlock(lock)     atomic_flag_clear((lock))
-#elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) /* 注意: */
-    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) /* 这是`GNU`编译器才支持的特殊宏, 例如：`CLANG`/`GCC`等 */
-    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) /* 然而这种实现并不完善, 相较于标准库可能会出现内存序问题 */
-    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8) /* 不过这在常见系统上可用, 且依然较`mutex`的实现性能更好 */
+#elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) || /* 注意: */
+       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) || /* 这是`GNU`编译器才支持的特殊宏, 例如：`CLANG`/`GCC`等 */
+       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || /* 然而这种实现并不完善, 相较于标准库可能会出现内存序问题 */
+       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)    /* 不过这在常见系统上可用, 且依然较`mutex`的实现性能更好 */
   #define uepoll_use_spinlock 2
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
