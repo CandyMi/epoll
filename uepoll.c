@@ -32,10 +32,10 @@
   #define epoll_spinlock_init(lock)       atomic_flag_clear((lock))
   #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set((lock)) == 1)
   #define epoll_spinlock_unlock(lock)     atomic_flag_clear((lock))
-#elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) || /* 注意: */
-       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) || /* 这是`GNU`编译器才支持的特殊宏, 例如：`CLANG`/`GCC`等 */
-       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || /* 然而这种实现并不完善, 相较于标准库可能会出现内存序问题 */
-       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)    /* 不过这在常见系统上可用, 且依然较`mutex`的实现性能更好 */
+#elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) || \
+       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) || \
+       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || \
+       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
   #define uepoll_use_spinlock 2
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
@@ -343,9 +343,9 @@ HANDLE epoll_create1(int flags)
 {
 #if uepoll_use_spinlock == 0
   if (!phandle) {
-    thread_mutex_init = dlsym(RTLD_DEFAULT, "pthread_mutex_init");
-    thread_mutex_lock = dlsym(RTLD_DEFAULT, "pthread_mutex_lock");
-    thread_mutex_unlock = dlsym(RTLD_DEFAULT, "pthread_mutex_unlock");
+    thread_mutex_init = dlsym((void*)RTLD_DEFAULT, "pthread_mutex_init");
+    thread_mutex_lock = dlsym((void*)RTLD_DEFAULT, "pthread_mutex_lock");
+    thread_mutex_unlock = dlsym((void*)RTLD_DEFAULT, "pthread_mutex_unlock");
     if (!thread_mutex_init || !thread_mutex_lock || !thread_mutex_unlock)
     {
       for(int i = 0; pthread_names[i]; i++) {
@@ -361,7 +361,7 @@ HANDLE epoll_create1(int flags)
       thread_mutex_lock = dlsym(phandle, "pthread_mutex_lock");
       thread_mutex_unlock = dlsym(phandle, "pthread_mutex_unlock");
     } else {
-      phandle = RTLD_DEFAULT;
+      phandle = (void*)RTLD_DEFAULT;
     }
   }
 #endif
@@ -390,7 +390,7 @@ HANDLE epoll_create1(int flags)
   FD_ZERO(&ep->eset);
   epoll_spinlock_init(&ep->lock);
   for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i]._nouse = 1; // 表示未使用fd.
-  struct epoll_event ev = { .data.ptr = NULL, .events = EPOLLIN, };
+  struct epoll_event ev; ev.data.ptr = 0; ev.events = EPOLLIN; ev._nouse =1;
   uepoll_add(ep, ep->pipes[1], &ev);
   return (HANDLE)ep;
 }
