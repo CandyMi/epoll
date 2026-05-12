@@ -22,10 +22,10 @@
   #define epoll_spinlock_init(lock)       atomic_flag_clear((lock))
   #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set((lock)) == 1)
   #define epoll_spinlock_unlock(lock)     atomic_flag_clear((lock))
-#elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) /* 注意: */
-    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) /* 这是`GNU`编译器才支持的特殊宏, 例如：`CLANG`/`GCC`等 */
-    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) /* 然而这种实现并不完善, 相较于标准库可能会出现内存序问题 */
-    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8) /* 不过这在常见系统上可用, 且依然较`mutex`的实现性能更好 */
+#elif defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) \
+   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) \
+   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) \
+   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
   #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
@@ -36,9 +36,11 @@
 
 #define EPOLL_INVALID (-1)
 #define EPOLLEMPTY (0)
+#define EPOLL_MAX_EVENTS 1024
 
 #define epoll_malloc(sz)  epoll_realloc(NULL, sz)
 #define epoll_free(ptr)   (void)epoll_realloc(ptr, 0)
+#define epoll_op_in(op)   ((op) == ((op) & (EPOLL_CTL_ADD | EPOLL_CTL_MOD | EPOLL_CTL_DEL)))
 
 struct epoll_t
 {
@@ -60,7 +62,6 @@ int epoll_close(HANDLE efd)
   if (ep->efd <= 0)
     return -1;
   close(ep->efd);
-  epoll_spinlock_unlock(&ep->lock);
   epoll_free(ep);
   return 0;
 }
@@ -163,7 +164,7 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
     return EPOLL_INVALID;
   }
 
-  if (op !=  EPOLL_CTL_ADD && op != EPOLL_CTL_DEL && op != EPOLL_CTL_MOD) {
+  if (!(epoll_op_in(op))) {
     errno = EINVAL;
     return EPOLL_INVALID;
   }
@@ -198,6 +199,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     errno = EINVAL;
     return EPOLL_INVALID;
   }
+  if (maxevents > EPOLL_MAX_EVENTS) maxevents = EPOLL_MAX_EVENTS;
 
   /* 兼容两者的时间行为 */
   struct timespec ts; struct timespec *tsp = NULL;
@@ -246,7 +248,6 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         nkqevents++; pos = i;
       } else {
         ev = &events[pos];
-        before_fd = -1; pos = 0; 
       }
 
       /* 判断 kqueue 事件 */

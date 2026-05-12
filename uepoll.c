@@ -111,9 +111,9 @@ uint64_t uepoll_now()
   struct timespec now;
   clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
   return now.tv_sec * 1000 + now.tv_nsec / 1000000;
-#elif defined(CLOCK_REALTINME_COARSE)
+#elif defined(CLOCK_REALTIME_COARSE)
   struct timespec now;
-  clock_gettime(CLOCK_REALTINME_COARSE, &now);
+  clock_gettime(CLOCK_REALTIME_COARSE, &now);
   return now.tv_sec * 1000 + now.tv_nsec / 1000000;
 #else
   struct timeval now; gettimeofday(&now, NULL);
@@ -139,7 +139,7 @@ bool uepoll_can_poll(SOCKET fd) {
   int r = fstat(fd, &st); // printf("r = %d, mode = %d\n", r, st.st_mode);
   if (r)
     return false;
-  return S_ISSOCK(st.st_mode) | S_ISFIFO(st.st_mode) | S_ISCHR(st.st_mode) | S_ISREG(st.st_mode);
+  return S_ISSOCK(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISCHR(st.st_mode) || S_ISREG(st.st_mode);
 }
 
 static inline
@@ -167,7 +167,7 @@ void uepoll_update_nfds(struct epoll_t* ep, SOCKET fd)
   {
     if (uepoll_has_fd(ep, fd))
     {
-      if (FD_ISSET(fd, &ep->rset) | FD_ISSET(fd, &ep->wset) | FD_ISSET(fd, &ep->eset))
+      if (FD_ISSET(fd, &ep->rset) || FD_ISSET(fd, &ep->wset) || FD_ISSET(fd, &ep->eset))
       {
         ep->nfds = fd + 1;
         return;
@@ -283,6 +283,7 @@ int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
     ep->udata[fd].events |= EPOLLONESHOT;
   }
 
+  ep->udata[fd].data.ptr = ev->data.ptr;
   epoll_notice(ep);
   uepoll_append_nfds(ep, fd);
   epoll_spinlock_unlock(&ep->lock);
@@ -371,6 +372,7 @@ HANDLE epoll_create1(int flags)
     errno = ENOMEM;
     return -1;
   }
+  ep->pipes[0] = ep->pipes[1] = -1;
   if (pipe(ep->pipes)) {
     errno = ENOMEM;
     epoll_close((HANDLE)ep);
