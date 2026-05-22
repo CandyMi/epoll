@@ -83,7 +83,7 @@ HANDLE epoll_create1(int flags)
     return -1;
   if (flags & EPOLL_CLOEXEC)
     fcntl(efd, F_SETFD, FD_CLOEXEC);
-  struct epoll_t *ep = epoll_malloc(sizeof(struct epoll_t));
+  struct epoll_t *ep = (epoll_t*)epoll_malloc(sizeof(struct epoll_t));
   ep->efd = efd; epoll_spinlock_init(&ep->lock);
   return (HANDLE)ep;
 }
