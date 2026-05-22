@@ -78,7 +78,7 @@
 #define epoll_nonblock(fd) fcntl(fd, F_SETFL, O_NONBLOCK | fcntl(fd, F_GETFL))
 
 #define epoll_notice(ep)  { ep->edited = true; write((ep)->pipes[1], "", 0); }
-#define epoll_receive(ep) ({ if (ep->edited) {ep->edited = false; char buffer[128]; read((ep)->pipes[0], buffer, 128);} })
+
 
 #define epoll_malloc(sz)  epoll_realloc(NULL, sz)
 #define epoll_free(ptr)   (void)epoll_realloc(ptr, 0)
@@ -95,6 +95,14 @@ struct epoll_t
   epoll_event udata[EPOLL_MAX_EVENTS];
 };
 
+static inline void epoll_receive(struct epoll_t *ep) {
+    if (ep->edited) {
+        ep->edited = false;
+        char buffer[128];
+        read(ep->pipes[0], buffer, 128);
+    }
+}
+
 static epoll_realloc_t epoll_realloc = realloc;
 void epoll_allocator(epoll_realloc_t realloc_func)
 {
@@ -103,7 +111,7 @@ void epoll_allocator(epoll_realloc_t realloc_func)
 }
 
 static inline
-uint64_t uepoll_now()
+int64_t uepoll_now()
 {
   /**
    * 不同时间源的调用性能差异很大, 因此尽量使用最快的时间源获取时间.
@@ -123,7 +131,7 @@ uint64_t uepoll_now()
 }
 
 static inline
-struct timeval* uepoll_timeout2timeval(int timeout, struct timeval* tv, uint64_t *now)
+struct timeval* uepoll_timeout2timeval(int timeout, struct timeval* tv, int64_t *now)
 {
   if (timeout >= 0) {
     tv->tv_sec = (timeout - timeout % 1000) / 1000;
@@ -417,7 +425,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     return EPOLL_INVALID;
   }
 
-  struct timeval ts = {0, 0}; uint64_t wait_time;
+  struct timeval ts = {0, 0}; int64_t wait_time;
   struct timeval *tp = uepoll_timeout2timeval(timeout, &ts, &wait_time);
   // printf("struct timeval ts {%zd, %zd}\n", ts.tv_sec, ts.tv_usec);
 
@@ -429,7 +437,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   FD_COPY(&ep->rset, &rset); FD_COPY(&ep->wset, &wset); FD_COPY(&ep->eset, &eset);
   epoll_spinlock_unlock(&ep->lock);
 
-  int nevents = 0; SOCKET fd = 0; struct epoll_event* ev;
+  int nevents = 0; struct epoll_event* ev;
   int r = select(nfds, &rset, &wset, &eset, tp);
   if (r > 0)
   { // select 返回的是事件数量, 不是文件描述符的数量.

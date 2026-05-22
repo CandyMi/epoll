@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/event.h>
+#include <alloca.h>
 
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
@@ -144,13 +145,13 @@ int kepoll_del(struct epoll_t *ep, SOCKET fd, bool deleted)
 {
   epoll_spinlock_lock(&ep->lock);
   int efd = ep->efd;
-  int r;
   int action = deleted ? EV_DELETE : EV_DISABLE;
   /* 可以一次系统调用可以删除/关闭此`fd`的所有事件 */
   struct kevent ev[3]; int nevents = 0;
   EV_SET(&ev[nevents++], fd, EVFILT_READ, action, 0, 0, NULL);
   EV_SET(&ev[nevents++], fd, EVFILT_WRITE, action, 0, 0, NULL);
-  r = kevent(efd, ev, nevents, NULL, 0, NULL);
+  (void)kevent(efd, ev, nevents, NULL, 0, NULL);
+  // int r = kevent(efd, ev, nevents, NULL, 0, NULL);
   // if (r) perror("kepoll_del");
   errno = 0;
   epoll_spinlock_unlock(&ep->lock);
@@ -211,7 +212,8 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     // printf("struct timespec = {%ld, %ld}\n", ts.tv_sec, ts.tv_nsec);
   }
 
-  struct kevent kqevents[maxevents]; struct epoll_event *ev;
+  struct kevent *kqevents = (struct kevent*)alloca(sizeof(struct kevent) * maxevents);
+  struct epoll_event *ev;
   int nevents = kevent(ep->efd, NULL, 0, kqevents, maxevents, tsp);
   // printf("nevents = %d\n", nevents);
   if (nevents > 0)
