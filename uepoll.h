@@ -9,14 +9,18 @@
     #define UEPOLL_EXPORT __attribute__((visibility("default")))
 #endif
 
+#ifndef NO_NATIVE_EPOLL
+    #define NO_NATIVE_EPOLL 1
+#endif
+
+#ifndef FD_SETSIZE
+    #define FD_SETSIZE 1024
+#endif
+
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
-
-#ifndef NO_NATIVE_EPOLL
-    #define NO_NATIVE_EPOLL 1
-#endif
 
 typedef intptr_t HANDLE;
 typedef int SOCKET;
