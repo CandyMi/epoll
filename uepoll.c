@@ -25,7 +25,8 @@
   #define epoll_spinlock_init(lock)       ((void)lock)
   #define epoll_spinlock_lock(lock)       ((void)lock)
   #define epoll_spinlock_unlock(lock)     ((void)lock)
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+#elif defined(EPOLL_USE_ATOMIC) || \
+  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
   #define uepoll_use_spinlock 1
   #include <stdatomic.h>
   typedef atomic_flag epoll_lock_t;

@@ -49,6 +49,12 @@ else()
   target_link_libraries(main PRIVATE epoll_static)
 endif()
 
+find_file(EPOLL_ATOMIC NAMES stdatomic.h)
+if (EPOLL_ATOMIC)
+  target_compile_definitions(epoll_dynamic PRIVATE EPOLL_USE_ATOMIC=1)
+  target_compile_definitions(epoll_static PRIVATE EPOLL_USE_ATOMIC=1)
+endif(EPOLL_ATOMIC)
+
 # ── 安装规则 ──────────────────────────────
 include(GNUInstallDirs)
 

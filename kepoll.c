@@ -16,7 +16,8 @@
   #define epoll_spinlock_init(lock)       ((void)lock)
   #define epoll_spinlock_lock(lock)       ((void)lock)
   #define epoll_spinlock_unlock(lock)     ((void)lock)
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__)
+#elif defined(EPOLL_USE_ATOMIC) || \
+  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
   #include <stdatomic.h>
   typedef atomic_flag epoll_lock_t;
   #define epoll_spinlock_init(lock)       atomic_flag_clear((lock))
@@ -83,7 +84,7 @@ HANDLE epoll_create1(int flags)
     return -1;
   if (flags & EPOLL_CLOEXEC)
     fcntl(efd, F_SETFD, FD_CLOEXEC);
-  struct epoll_t *ep = (epoll_t*)epoll_malloc(sizeof(struct epoll_t));
+  struct epoll_t *ep = (struct epoll_t*)epoll_malloc(sizeof(struct epoll_t));
   ep->efd = efd; epoll_spinlock_init(&ep->lock);
   return (HANDLE)ep;
 }
