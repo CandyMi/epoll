@@ -11,8 +11,9 @@ cmake_minimum_required(VERSION 3.10)
 # 项目名称
 project("epoll")
 
-set(CMAKE_C_STANDARD 99)
-
+# 不强制指定 C 标准：新版编译器（GCC 5+ / Clang 3.3+ / MSVC 2015+）
+# 默认使用 C11 或更新标准，代码通过 __STDC_VERSION__ 自适应。
+# 最低需求 C99（for 循环内声明、stdbool.h、// 注释）。
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
 
 add_executable(main main.c)

@@ -106,7 +106,7 @@
 | **其他 POSIX** (Solaris, AIX, QNX, Haiku 等) | `else()` | fallback | `uepoll.c` | select |
 
 - **编译器**：MSVC / GCC / Clang
-- **C 标准**：`CMAKE_C_STANDARD 99`（[`CMakeLists.txt:12`](CMakeLists.txt:12)）。实际最低基线为 **C99 + GNU `__sync_*` 扩展**；若 `<stdatomic.h>` 可用则自动启用 C11 原子操作（[`kepoll.c:21`](kepoll.c:21) / [`uepoll.c:29`](uepoll.c:29) 检查 `__STDC_VERSION__ >= 201112L`）。
+- **C 标准**：不强制指定（新版编译器默认 C11/C17）。最低需求 C99（`for` 循环内声明、`<stdbool.h>`、`//` 注释）。若 `<stdatomic.h>` 可用则自动启用 C11 原子操作（[`kepoll.c:21`](kepoll.c:21) / [`uepoll.c:29`](uepoll.c:29) 检查 `__STDC_VERSION__ >= 201112L`），否则回退到 GCC `__sync_*` 内置原子。
 - **架构**：32/64-bit 均支持。`HANDLE` 类型随指针宽度自适应（`intptr_t` / `void*`），无内联汇编或边端序假设。
 
 ## 构建与测试
@@ -139,7 +139,7 @@ ET 模式测试（`testcase_epoll_et_mode`）被注释掉（[`main.c:250`](main.
 
 ## 编码约定
 
-- **C99 标准**：[`CMakeLists.txt:10`](CMakeLists.txt:10) `set(CMAKE_C_STANDARD 99)`。
+- **C 标准**：不强制指定，由编译器默认决定（通常 C11 或更新）。最低兼容 C99。
 - **命名前缀**：uepoll 内部函数以 `uepoll_` 为前缀；kepoll 内部函数以 `kepoll_` 或 `_kepoll_` 为前缀。
 - **锁宏抽象**：`epoll_spinlock_init/lock/unlock` 宏统一接口，底层实现由编译时条件选择。
 - **内存分配**：所有内部分配走 `epoll_realloc` 函数指针（默认 `realloc`），可通过 `epoll_allocator()` 替换（[`uepoll.c:100`](uepoll.c:100)）。
