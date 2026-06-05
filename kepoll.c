@@ -86,6 +86,11 @@ HANDLE epoll_create1(int flags)
   if (flags & EPOLL_CLOEXEC)
     fcntl(efd, F_SETFD, FD_CLOEXEC);
   struct epoll_t *ep = (struct epoll_t*)epoll_malloc(sizeof(struct epoll_t));
+  if (!ep) {
+    errno = ENOMEM;
+    close(efd);
+    return -1;
+  }
   ep->efd = efd; epoll_spinlock_init(&ep->lock);
   return (HANDLE)ep;
 }
@@ -186,7 +191,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 {
   errno = 0;
 
-  if (efd < 0) {
+  if (efd <= 0) {
     errno = EBADF; // 指针不会为负数.
     return EPOLL_INVALID;
   }
@@ -223,7 +228,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
      * 1. 合并相同`fd`的事件.
      * 2. 实现单`fd`的`ONESHOT`删除.
      */
-    uint32_t before_fd = -1; int pos = 0; int nkqevents = 0;
+    uintptr_t before_fd = (uintptr_t)-1; int pos = 0; int nkqevents = 0;
     for (int i = 0; i < nevents; i++)
     {
       uint16_t flags = kqevents[i].flags;
@@ -235,8 +240,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         ev = &events[i];
         ev->events = EPOLLERR;
         if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
-        if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLOUT;
+        if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
         ev->data.ptr = kqevents[i].udata;
+        nkqevents++;
         continue;
       }
       // printf("kqevents[%d] = {.fd = %ld, .filter = %d, .flags = 0x%08x, .fflags = 0x%08x}\n", i, kqevents[i].ident, kqevents[i].filter, kqevents[i].flags, kqevents[i].fflags);

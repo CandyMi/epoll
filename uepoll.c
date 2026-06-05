@@ -77,7 +77,7 @@
 #define epoll_nonexec(fd)  fcntl(fd, F_SETFD, FD_CLOEXEC | fcntl(fd, F_GETFD))
 #define epoll_nonblock(fd) fcntl(fd, F_SETFL, O_NONBLOCK | fcntl(fd, F_GETFL))
 
-#define epoll_notice(ep)  { ep->edited = true; write((ep)->pipes[1], "", 0); }
+#define epoll_notice(ep)  { ep->edited = true; write((ep)->pipes[1], "x", 1); }
 
 
 #define epoll_malloc(sz)  epoll_realloc(NULL, sz)
@@ -330,7 +330,6 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 
 int epoll_close(HANDLE efd)
 {
-  errno = 0;
   if (efd <= 0) {
     errno = EBADF; // 指针不会为负数.
     return EPOLL_INVALID;
@@ -383,7 +382,6 @@ HANDLE epoll_create1(int flags)
   }
   ep->pipes[0] = ep->pipes[1] = -1;
   if (pipe(ep->pipes)) {
-    errno = ENOMEM;
     epoll_close((HANDLE)ep);
     return -1;
   }
@@ -402,7 +400,7 @@ HANDLE epoll_create1(int flags)
   epoll_spinlock_init(&ep->lock);
   for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i]._nouse = 1; // 表示未使用fd.
   struct epoll_event ev; ev.data.ptr = 0; ev.events = EPOLLIN; ev._nouse =1;
-  uepoll_add(ep, ep->pipes[1], &ev);
+  uepoll_add(ep, ep->pipes[0], &ev);
   return (HANDLE)ep;
 }
 

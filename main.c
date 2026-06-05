@@ -144,7 +144,7 @@ EPOLL_TEST_FUNCTION(testcase_epoll_watch, {
     assert(event[0].data.fd == RPIPE);
     assert(event[0].events == EPOLLIN);
     char *buf = malloc(strlen(sendbuf) + 1);
-    r = read(RPIPE, buf, 128);
+    r = read(RPIPE, buf, strlen(sendbuf) + 1);
     assert(r == strlen(sendbuf));
     free(buf); epoll_close(efd);
 #endif
