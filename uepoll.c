@@ -43,25 +43,7 @@
   #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
   #define epoll_spinlock_unlock(lock)     __sync_lock_release((lock))
 #else
-  /* 使用`pthread`的`mutex`来完成线程安全, 可以保守的预估最大兼容性 */
-  #define uepoll_use_spinlock 0
-  #include <dlfcn.h>
-  #include <pthread.h>
-  typedef pthread_mutex_t epoll_lock_t;
-  #define epoll_spinlock_init(lock)       thread_mutex_init(lock, NULL)
-  #define epoll_spinlock_lock(lock)       thread_mutex_lock(lock)
-  #define epoll_spinlock_unlock(lock)     thread_mutex_unlock(lock)
-  typedef void (*thread_mutex_init_t) (pthread_mutex_t*, const pthread_mutexattr_t *);
-  typedef void (*thread_mutex_lock_t) (pthread_mutex_t*);
-  static void* phandle = NULL;
-  static thread_mutex_init_t thread_mutex_init = NULL;
-  static thread_mutex_lock_t thread_mutex_lock = NULL;
-  static thread_mutex_lock_t thread_mutex_unlock = NULL;
-  const char *pthread_names[] = {
-    "libpthread.so.0", "libpthread.so.1",
-    "libpthread.so.2", "libpthread.so.3",
-    "libpthread.so", NULL, NULL,
-  };
+  #error "Hey! Why doesn't your compiler support atomic operations yet?"
 #endif
 
 #define EPOLL_MAX_EVENTS FD_SETSIZE
@@ -350,30 +332,6 @@ HANDLE epoll_create(int size)
 
 HANDLE epoll_create1(int flags)
 {
-#if uepoll_use_spinlock == 0
-  if (!phandle) {
-    thread_mutex_init = dlsym((void*)RTLD_DEFAULT, "pthread_mutex_init");
-    thread_mutex_lock = dlsym((void*)RTLD_DEFAULT, "pthread_mutex_lock");
-    thread_mutex_unlock = dlsym((void*)RTLD_DEFAULT, "pthread_mutex_unlock");
-    if (!thread_mutex_init || !thread_mutex_lock || !thread_mutex_unlock)
-    {
-      for(int i = 0; pthread_names[i]; i++) {
-        phandle = dlopen(pthread_names[i], RTLD_NOW);
-        if (phandle) break;
-        // printf("path = [%s] not found.\n", pthread_names[i]);
-      }
-      if (!phandle) {
-        errno = ENOMEM;
-        return EPOLL_INVALID;
-      }
-      thread_mutex_init = dlsym(phandle, "pthread_mutex_init");
-      thread_mutex_lock = dlsym(phandle, "pthread_mutex_lock");
-      thread_mutex_unlock = dlsym(phandle, "pthread_mutex_unlock");
-    } else {
-      phandle = (void*)RTLD_DEFAULT;
-    }
-  }
-#endif
   errno = 0;
   struct epoll_t *ep = (struct epoll_t *)epoll_malloc(sizeof(struct epoll_t));
   if (!ep) {
