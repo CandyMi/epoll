@@ -11,16 +11,18 @@ This is a **Linux epoll ABI compatibility layer** for cross-platform event-drive
 
 ```mermaid
 flowchart TD
-    User["User Code"] -- import epoll.h --> epoll_h["epoll.h (Dispatch Layer)"]
-    epoll_h -- "__linux__ / __ANDROID__" --> linux["epoll.c\nKernel epoll"]
+    User["User Code"] -- '#include "epoll.h"' --> epoll_h["epoll.h (Dispatch Layer)"]
+    epoll_h -- "__linux__ / __ANDROID__\n(NO_NATIVE_EPOLL=0)" --> linux["epoll.c\nKernel epoll"]
+    epoll_h -- "Linux + -DNO_NATIVE_EPOLL=1" --> uepoll_h
     epoll_h -- WIN32 --> win["wepoll.c\nIOCP + NT API"]
     epoll_h -- other --> uepoll_h["uepoll.h (types + API)"]
     uepoll_h -- "macOS / BSD" --> kqueue["kepoll.c\nkqueue / kevent"]
     uepoll_h -- "other POSIX" --> select["uepoll.c\nselect / fd_set"]
 ```
 
-**Dispatch logic** in [`epoll.h:4-26`](epoll.h:4):
-- `__linux__` / `__ANDROID__` → sets `NO_NATIVE_EPOLL=0`, includes `<sys/epoll.h>` directly, defines thin shim functions
+**Dispatch logic** in [`include/epoll/epoll.h`](include/epoll/epoll.h):
+- `__linux__` / `__ANDROID__` + `NO_NATIVE_EPOLL=0` (default) → includes `<sys/epoll.h>` directly, defines thin shim functions
+- `__linux__` + `-DNO_NATIVE_EPOLL=1` → includes `uepoll.h` (for CI/testing)
 - `WIN32` → delegates to `wepoll.h`
 - All others → delegates to `uepoll.h` (which is itself included by `kepoll.c` on BSD/Darwin at compile time)
 
@@ -36,19 +38,21 @@ epoll/
 ├── AGENTS.md                   Project reference (this file)
 ├── include/
 │   └── epoll/
-│       ├── epoll.h   (27 L)    Dispatch header — #if/#elif/#else selects backend
+│       ├── epoll.h   (36 L)    Dispatch header — #if/#elif/#else selects backend;
+│       │                         respects -DNO_NATIVE_EPOLL=1 to force uepoll on Linux
 │       ├── uepoll.h  (106 L)   Non-Linux API types/constants/signatures (HANDLE=intptr_t)
 │       └── wepoll.h  (119 L)   Windows API definitions (HANDLE=void*, SOCKET=uintptr_t)
 ├── src/
 │   ├── epoll.c     (12 L)      Linux native shim — no-op allocator + close(2) wrapper
-│   ├── kepoll.c    (280 L)     macOS/BSD kqueue backend — struct epoll_t {int efd; lock}
+│   ├── kepoll.c    (304 L)     macOS/BSD kqueue backend — struct epoll_t {int efd; lock;
+│   │                         kqevents[] heap buffer}
 │   ├── uepoll.c    (461 L)     POSIX select fallback — self-waking pipe + fd_set
 │   └── wepoll.c    (2184 L)    Windows IOCP backend (vendored piscisaureus/wepoll)
 ├── test/
-│   └── main.c      (426 L)     15 test cases via EPOLL_TEST_FUNCTION macro
+│   └── main.c      (411 L)     15 test cases via EPOLL_TEST_FUNCTION macro;
+│                                 guarded for WIN32 / uses epoll_create(1)
 └── docs/
-    ├── api.md                  Full API reference (functions, flags, ET/LT, examples)
-    └── et_and_lt.md            (removed — content merged into api.md)
+    └── api.md                  Full API reference (functions, flags, ET/LT, examples, build)
 ```
 
 ## Public API (6 functions, uniform across all backends)
@@ -71,11 +75,12 @@ epoll/
 
 ### kepoll.c — kqueue Backend
 
-- **HANDLE is a pointer**: [`kepoll.c:54`](kepoll.c:54) `struct epoll_t` wraps a kqueue fd + spinlock. `epoll_create1` at [`kepoll.c:82-97`](kepoll.c:82) allocates this struct (with NULL check; closes kqueue fd on OOM).
+- **HANDLE is a pointer**: [`kepoll.c:54`](kepoll.c:54) `struct epoll_t` wraps a kqueue fd + spinlock + heap-allocated `kqevents[]` buffer. `epoll_create1` pre-allocates the kevent buffer (sized `EPOLL_MAX_EVENTS`) to avoid `alloca()` on every `epoll_wait`. On OOM, the kqueue fd is closed and the allocation is freed.
 - **Event mapping** ([`kepoll.c:96-121`](kepoll.c:96)): `EPOLLIN|RDNORM|RDBAND → EVFILT_READ`, `EPOLLOUT|WRNORM|WRBAND → EVFILT_WRITE`. Non-requested filters are registered as `EV_DISABLE`.
 - **Event merging** ([`kepoll.c:162-197`](kepoll.c:162)): kqueue returns separate READ/WRITE events for the same fd. A `uintptr_t before_fd` cache merges adjacent same-fd events into a single `epoll_event`. ERROR/EOF events are handled separately and counted in the return value.
 - **ET mode** ([`kepoll.c:104-105`](kepoll.c:104)): `EPOLLET → EV_CLEAR` flag on kevent.
 - **ONESHOT handling** ([`kepoll.c:172-174`](kepoll.c:172)): After returning from `epoll_wait`, EV_ONESHOT events call `kepoll_del(ep, fd, false)` (DISABLE only, not DELETE).
+- **NULL event validation** ([`kepoll.c:66-70`](kepoll.c:66)): `_kepoll_register` checks for NULL `event` and returns `EFAULT` before taking the spinlock.
 - **Thread safety** ([`kepoll.c:14-34`](kepoll.c:14)): 3-level degrading spinlock (C11 `atomic_flag` → GCC `__sync_*` → `#error`). No pthread fallback.
 - **Hardcoded maxevents**: [`kepoll.c:38`](kepoll.c:38) `#define EPOLL_MAX_EVENTS 1024`.
 
@@ -83,7 +88,7 @@ epoll/
 
 - **Core data structure** ([`uepoll.c:82-91`](uepoll.c:82)): `struct epoll_t` contains `nfds` + `pipes[2]` (self-waking pipe) + `epoll_lock_t` + three `fd_set`s + `epoll_event udata[FD_SETSIZE]`.
 - **fd = array index** ([`uepoll.c:90`](uepoll.c:90)): `udata[fd]` — this is why fd upper bound = `FD_SETSIZE` (default 1024 per [`uepoll.h:16-18`](uepoll.h:16)).
-- **Self-waking mechanism** ([`uepoll.c:80`](uepoll.c:80)): `epoll_notice` macro writes `"x"` (1 byte) to `pipes[1]` after `epoll_ctl` modifies the fd sets, waking any `epoll_wait` blocked in `select()`. [`uepoll.c:93-99`](uepoll.c:93) `epoll_receive` drains the pipe. The pipe read end (`pipes[0]`) is registered into the epoll instance itself during `epoll_create1` ([`uepoll.c:405`](uepoll.c:405)), and `epoll_wait` detects the wake via `FD_ISSET(ep->pipes[0], &rset)`.
+- **Self-waking mechanism** ([`uepoll.c:80`](uepoll.c:80)): `epoll_notice` macro writes `"x"` (1 byte) to `pipes[1]` after `epoll_ctl` modifies the fd sets, waking any `epoll_wait` blocked in `select()`. [`uepoll.c:93-99`](uepoll.c:93) `epoll_receive` drains the pipe with a 1024-byte buffer in a `while` loop (fully clears the pipe to prevent spurious wake-ups under heavy concurrent modification). The pipe read end (`pipes[0]`) is registered into the epoll instance itself during `epoll_create1` ([`uepoll.c:405`](uepoll.c:405)), and `epoll_wait` detects the wake via `FD_ISSET(ep->pipes[0], &rset)`.
 - **Thread safety 3-level degrading** ([`uepoll.c:23-43`](uepoll.c:23)):
   - Level 0: `EPOLL_NO_THREADS` macro → no-ops
   - Level 1: C11 `<stdatomic.h>` → `atomic_flag` TAS spinlock
@@ -133,6 +138,20 @@ CMake selects the backend by `CMAKE_SYSTEM_NAME` ([`CMakeLists.txt`](CMakeLists.
 
 **Build artifacts:** shared library (`libepoll.so`/`.dylib`/`.dll`) + static library (`libepoll.a`/`.lib`) + test executable (`build/main`).
 
+**AddressSanitizer** (GCC/Clang, debug builds):
+```bash
+cmake -S . -B build_asan -DENABLE_ASAN=ON
+cmake --build build_asan
+./build_asan/main
+```
+On MSVC, use `/fsanitize=address` in `CMAKE_C_FLAGS` manually.
+
+**Force select backend on Linux** (for testing):
+```bash
+cmake -S . -B build -DNO_NATIVE_EPOLL=1
+cmake --build build
+```
+
 Install headers to `${CMAKE_INSTALL_INCLUDEDIR}/epoll/` and libraries to `${CMAKE_INSTALL_LIBDIR}`.
 
 ### Test
@@ -155,7 +174,7 @@ Install headers to `${CMAKE_INSTALL_INCLUDEDIR}/epoll/` and libraries to `${CMAK
 | `windows-clang` | windows-latest | `src/wepoll.c` (IOCP) | ClangCL |
 | `windows-mingw` | windows-latest | `src/wepoll.c` (IOCP) | MinGW-w64 (GCC) |
 
-15 active test cases registered in `main()` ([`main.c:268-283`](main.c:268)):
+15 active test cases registered in `main()` ([`test/main.c:270-285`](test/main.c:270)):
 1. `testcase_epoll_timer` — epoll_wait timeout accuracy
 2. `testcase_epoll_alloc` — rapid create/close (100k iterations)
 3. `testcase_epoll_watch` — basic EPOLLIN watch on pipe
@@ -181,7 +200,7 @@ Install headers to `${CMAKE_INSTALL_INCLUDEDIR}/epoll/` and libraries to `${CMAK
 - **Spinlock abstraction:** `epoll_spinlock_init/lock/unlock` macros provide a uniform interface, with compile-time selection of the backing implementation.
 - **Memory allocation:** All internal allocations go through the `epoll_realloc` function pointer (defaults to `realloc`), replaceable via `epoll_allocator()` ([`uepoll.c:100`](uepoll.c:100)).
 - **Error handling:** Return `-1` and set `errno` (`EBADF`, `EINVAL`, `ENOENT`, `EEXIST`, `ENOMEM`, `EPERM`, `EFAULT`, `ENOSPC`).
-- **Platform isolation:** `#ifndef WIN32` guards platform-specific code (e.g., pipe/socketpair tests in `main.c`).
+- **Platform isolation:** `#ifndef WIN32` wraps entire `EPOLL_TEST_FUNCTION` calls (not inside macro arguments, since MSVC rejects preprocessor directives in macro parameters).
 - **`HANDLE` type varies by platform:** Linux=`int`, Windows=`void*`, others=`intptr_t`. Casting `HANDLE` to `struct epoll_t*` in the code is intentional.
 
 ## Common Pitfalls
@@ -190,10 +209,11 @@ Install headers to `${CMAKE_INSTALL_INCLUDEDIR}/epoll/` and libraries to `${CMAK
 2. **fd upper bound:** The uepoll (select) backend is limited by `FD_SETSIZE` (default 1024, [`uepoll.h:16-18`](uepoll.h:16)). kepoll has a hardcoded `EPOLL_MAX_EVENTS=1024` ([`kepoll.c:38`](kepoll.c:38)).
 3. **ET mode is non-portable:** The select backend does not support `EPOLLET`. The README explicitly documents this limitation.
 4. **wepoll only supports SOCKET/Pipe:** Regular file descriptors cannot be used with epoll on Windows.
-5. **kepoll event merging requires sufficient maxevents:** `epoll_wait`'s `maxevents` must be ≥ the actual number of kqueue events returned, otherwise the merge logic may truncate (see [`main.c:227`](main.c:227) test comment).
-6. **`epoll_create`'s `size` parameter is ignored:** Matches Linux 2.6.8+ behavior, but legacy code may depend on it.
+5. **kepoll event merging requires sufficient maxevents:** `epoll_wait`'s `maxevents` must be ≥ the actual number of kqueue events returned, otherwise the merge logic may truncate (see [`test/main.c:227`](test/main.c:227) test comment).
+6. **`epoll_create(0)` fails on Linux:** The Linux kernel rejects `size == 0` with `EINVAL` (since 2.6.8). Always use `epoll_create(1)` or larger for portable code.
 7. **`epoll_close` behavior differs:** kepoll returns `-1` when `efd <= 0` ([`kepoll.c:72-73`](kepoll.c:72)); the Linux shim calls `close(efd)` directly ([`epoll.c:11`](epoll.c:11)).
-8. **Self-waking pipe fd consumption:** The pipe read end (`pipes[0]`) is registered in the epoll instance itself ([`uepoll.c:405`](uepoll.c:405)). In multi-threaded scenarios, `epoll_ctl` modifications write 1 byte to `pipes[1]` to wake `epoll_wait`. Ensure the pipe buffer is not overfilled by rapid modifications.
+8. **NULL events to `epoll_wait`:** On Linux kernel, `epoll_wait(efd, NULL, ...)` may return 0 instead of `EFAULT` if no events are pending (kernel only validates the pointer when it has data to write). Our non-Linux backends always check `events != NULL` upfront.
+9. **Self-waking pipe fd drain:** The pipe read end (`pipes[0]`) is registered in the epoll instance itself ([`uepoll.c:405`](uepoll.c:405)). The drain loop now uses a 1024-byte buffer and reads in a `while` loop — fully clearing the pipe under heavy concurrent modification.
 
 ## Modification Guide
 

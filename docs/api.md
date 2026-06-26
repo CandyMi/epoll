@@ -75,7 +75,7 @@ Create a new epoll instance.
 
 | Parameter | Description |
 |---|---|
-| `size` | Ignored (must be ≥ 0). Matches Linux 2.6.8+ behavior |
+| `size` | Ignored (must be ≥ 0). **Linux kernel rejects `size == 0`** with `EINVAL` — use `epoll_create(1)` or larger for portable code |
 
 | Return | Description |
 |---|---|
@@ -84,7 +84,7 @@ Create a new epoll instance.
 
 | `errno` | Condition |
 |---|---|
-| `EINVAL` | `size < 0` |
+| `EINVAL` | `size < 0`, or `size == 0` on Linux kernel |
 | `ENOMEM` | Out of memory |
 | (system) | See `epoll_create1` for underlying failures |
 
@@ -224,9 +224,11 @@ Wait for events on the epoll instance.
 | `errno` | Condition |
 |---|---|
 | `EBADF` | Invalid epoll handle |
-| `EFAULT` | `events` is `NULL` |
+| `EFAULT` | `events` is `NULL` (see note below) |
 | `EINVAL` | `maxevents ≤ 0` |
 | (system) | Backend-specific `select()`/`kevent()`/`GetQueuedCompletionStatus()` error |
+
+**⚠️ `EFAULT` note for Linux kernel:** The kernel only validates the `events` pointer when events are actually pending. If no events are ready and `timeout=0`, `epoll_wait` returns `0` immediately **without** checking the pointer — so `EFAULT` is **not** guaranteed. Our non-Linux backends always check `events != NULL` upfront. For portable code, never rely on `EFAULT` being returned for NULL events.
 
 **Timeout behavior:**
 - `timeout = -1`: Block indefinitely until at least one event is available.
@@ -436,12 +438,18 @@ Or compile directly:
 # Linux (kernel epoll)
 gcc -I include/epoll src/epoll.c test/main.c -o main
 
+# Linux (force select fallback for testing)
+gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/uepoll.c test/main.c -o main
+
 # macOS/BSD (kqueue)
 gcc -I include/epoll src/kepoll.c test/main.c -o main
 
 # POSIX fallback (select)
 gcc -I include/epoll src/uepoll.c test/main.c -o main
 
-# Windows (IOCP)
+# Windows (IOCP, MSVC)
 cl /I include/epoll src/wepoll.c test/main.c
+
+# Windows (IOCP, MinGW)
+gcc -I include/epoll src/wepoll.c test/main.c -o main.exe -lws2_32
 ```
