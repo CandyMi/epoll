@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: mkdir -p build && gcc -I include/epoll src/uepoll.c test/main.c -o build/select_main
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/uepoll.c test/main.c -o build/select_main
       - run: ./build/select_main
 
   # ── macOS ─────────────────────────────────────

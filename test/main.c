@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "epoll.h"
 
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(WIN32)
   #define WIN32
 #endif
 
@@ -262,6 +262,9 @@ EPOLL_TEST_FUNCTION(testcase_epoll_ctl_error, {
     /* epoll_wait invalid args */
     r = epoll_wait((HANDLE)-1, &ev, 1, 0);
     assert(r != 0);
+    /* write data so kernel has events to send — otherwise Linux epoll_wait
+     * returns 0 without checking the events pointer (no events pending). */
+    write(fds[1], "x", 1);
     r = epoll_wait(efd, NULL, 1, 0);
     assert(r != 0);
     r = epoll_wait(efd, &ev, 0, 0);

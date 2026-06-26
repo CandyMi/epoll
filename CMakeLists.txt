@@ -9,6 +9,18 @@ cmake_minimum_required(VERSION 3.10)
 
 project("epoll")
 
+# ── AddressSanitizer (GCC/Clang only; MSVC uses /fsanitize=address) ──
+option(ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
+if(ENABLE_ASAN)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-fsanitize=address -g -O1 -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address)
+    message(STATUS "AddressSanitizer enabled")
+  elseif(MSVC)
+    message(STATUS "MSVC: use /fsanitize=address in CMAKE_C_FLAGS manually")
+  endif()
+endif()
+
 # C standard not forced — modern compilers default to C11/C17.
 # Minimum C99 (for-loop decl, stdbool.h, // comments).
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
@@ -38,6 +50,8 @@ add_library(epoll_static STATIC ${epoll_src})
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
   set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
   set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
+  target_link_libraries(epoll_dynamic PRIVATE ws2_32)
+  target_link_libraries(epoll_static PUBLIC ws2_32)
 else()
   set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
   set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")

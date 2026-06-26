@@ -1,0 +1,1 @@
+/Library/Developer/CommandLineTools/usr/bin/cc  -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX13.1.sdk -mmacosx-version-min=12.7 -dynamiclib -Wl,-headerpad_max_install_names -fsanitize=address -o libepoll.dylib -install_name @rpath/libepoll.dylib CMakeFiles/epoll_dynamic.dir/src/kepoll.c.o
