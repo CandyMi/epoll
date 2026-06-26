@@ -61,3 +61,6 @@ Mkfile.old
 dkms.conf
 
 build
+build_*
+build_select
+*.exe
