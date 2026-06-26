@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["master", "main"]
+
+jobs:
+  # ── Linux ─────────────────────────────────────
+  linux-gcc:
+    name: "Linux · GCC · kernel epoll"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_C_COMPILER=gcc
+      - run: cmake --build build
+      - run: ./build/main
+
+  linux-clang:
+    name: "Linux · Clang · kernel epoll"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_C_COMPILER=clang
+      - run: cmake --build build
+      - run: ./build/main
+
+  linux-select:
+    name: "Linux · GCC · select fallback (uepoll)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: gcc -I include/epoll src/uepoll.c test/main.c -o build/select_main
+      - run: ./build/select_main
+
+  # ── macOS ─────────────────────────────────────
+  macos-clang:
+    name: "macOS · Clang · kqueue"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build
+      - run: cmake --build build
+      - run: ./build/main
+
+  # ── Windows ───────────────────────────────────
+  windows-msvc:
+    name: "Windows · MSVC · IOCP (wepoll)"
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build
+      - run: cmake --build build --config Release
+      - run: build\Release\main.exe
+
+  windows-clang:
+    name: "Windows · ClangCL · IOCP (wepoll)"
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -T ClangCL
+      - run: cmake --build build --config Release
+      - run: build\Release\main.exe
+
+  windows-mingw:
+    name: "Windows · MinGW (GCC) · IOCP (wepoll)"
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+      - run: cmake -S . -B build -G "MinGW Makefiles" -DCMAKE_C_COMPILER=gcc
+      - run: cmake --build build
+      - run: ./build/main.exe

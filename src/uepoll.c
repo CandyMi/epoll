@@ -80,8 +80,8 @@ struct epoll_t
 static inline void epoll_receive(struct epoll_t *ep) {
     if (ep->edited) {
         ep->edited = false;
-        char buffer[128];
-        read(ep->pipes[0], buffer, 128);
+        char buffer[1024];
+        while (read(ep->pipes[0], buffer, sizeof(buffer)) > 0) {}
     }
 }
 

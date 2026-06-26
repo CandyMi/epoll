@@ -1,166 +1,203 @@
-# AGENTS.md — epoll 跨平台兼容层
+# AGENTS.md — epoll Cross-Platform Compatibility Layer
 
-## 项目定位
+## Project Overview
 
-这是一个**Linux epoll ABI 的跨平台模拟层**。用户只需 `#include "epoll.h"`，即可在 Linux、Windows、macOS/FreeBSD 及其他 POSIX 系统上用同一个 API 编写事件驱动代码。
+This is a **Linux epoll ABI compatibility layer** for cross-platform event-driven programming. Users simply `#include "epoll.h"` and write to the epoll API on Linux, Windows, macOS/FreeBSD, and any other POSIX system.
 
-## 架构总览
+**Author:** CandyMi — [github.com/CandyMi](https://github.com/CandyMi)  
+**License:** MIT
 
-```
-                          ┌─────────────────────┐
-                          │        epoll.h      │  ← 用户的唯一条目头文件
-                          │  (分派层 Dispatcher) │
-                          └──────────┬──────────┘
-                                     │ 预处理器分支
-            ┌────────────────┬───────┼────────┬────────────────┐
-            ▼                ▼                ▼                ▼
-     Linux/Android        Windows        macOS/FreeBSD      其他 POSIX
-    ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐
-    │   epoll.c    │ │  wepoll.c    │ │   kepoll.c   │ │   uepoll.c   │
-    │    epoll     │ │    IOCP      │ │    kqueue    │ │    select    │
-    └──────────────┘ └──────────────┘ └──────────────┘ └──────────────┘
+## Architecture
+
+```mermaid
+flowchart TD
+    User["User Code"] -- import epoll.h --> epoll_h["epoll.h (Dispatch Layer)"]
+    epoll_h -- "__linux__ / __ANDROID__" --> linux["epoll.c\nKernel epoll"]
+    epoll_h -- WIN32 --> win["wepoll.c\nIOCP + NT API"]
+    epoll_h -- other --> uepoll_h["uepoll.h (types + API)"]
+    uepoll_h -- "macOS / BSD" --> kqueue["kepoll.c\nkqueue / kevent"]
+    uepoll_h -- "other POSIX" --> select["uepoll.c\nselect / fd_set"]
 ```
 
-分派逻辑在 [`epoll.h:4-24`](epoll.h:4)：
-- `__linux__` / `__ANDROID__` → `NO_NATIVE_EPOLL=0`，直接用内核 epoll
-- `WIN32` → 委托给 `wepoll.h`
-- 其他 → 委托给 `uepoll.h`（uepoll.h 内部按平台再分发到 uepoll.c 或 kepoll.c）
+**Dispatch logic** in [`epoll.h:4-26`](epoll.h:4):
+- `__linux__` / `__ANDROID__` → sets `NO_NATIVE_EPOLL=0`, includes `<sys/epoll.h>` directly, defines thin shim functions
+- `WIN32` → delegates to `wepoll.h`
+- All others → delegates to `uepoll.h` (which is itself included by `kepoll.c` on BSD/Darwin at compile time)
 
-**实际后端选择由 CMakeLists.txt 的 OS 条件编译决定**（[`CMakeLists.txt:15-32`](CMakeLists.txt:15)）：构建时只编译一个 `.c` 文件，但所有后端共享同一套 API 签名。
+**The actual backend selection is done by CMake at build time** ([`CMakeLists.txt:15-32`](CMakeLists.txt:15)): only one `.c` file is compiled per platform. All backends share the same 6-function API signature.
 
-## 文件清单
+## File Inventory
 
-| 文件 | 角色 | 关键细节 |
+```
+epoll/
+├── CMakeLists.txt              Build system (OS-conditional compilation + install rules)
+├── README.md                   User documentation (platforms, features, usage)
+├── LICENSE                     MIT License
+├── AGENTS.md                   Project reference (this file)
+├── include/
+│   └── epoll/
+│       ├── epoll.h   (27 L)    Dispatch header — #if/#elif/#else selects backend
+│       ├── uepoll.h  (106 L)   Non-Linux API types/constants/signatures (HANDLE=intptr_t)
+│       └── wepoll.h  (119 L)   Windows API definitions (HANDLE=void*, SOCKET=uintptr_t)
+├── src/
+│   ├── epoll.c     (12 L)      Linux native shim — no-op allocator + close(2) wrapper
+│   ├── kepoll.c    (280 L)     macOS/BSD kqueue backend — struct epoll_t {int efd; lock}
+│   ├── uepoll.c    (461 L)     POSIX select fallback — self-waking pipe + fd_set
+│   └── wepoll.c    (2184 L)    Windows IOCP backend (vendored piscisaureus/wepoll)
+├── test/
+│   └── main.c      (426 L)     15 test cases via EPOLL_TEST_FUNCTION macro
+└── docs/
+    ├── api.md                  Full API reference (functions, flags, ET/LT, examples)
+    └── et_and_lt.md            (removed — content merged into api.md)
+```
+
+## Public API (6 functions, uniform across all backends)
+
+| Function | Signature Location | Semantics |
 |---|---|---|
-| `epoll.h` | 分派层头文件 | 仅 ~24 行，纯 `#if/#elif/#else` |
-| `uepoll.h` | 非 Linux 平台的 API 定义 | 定义 `HANDLE=intptr_t`、`SOCKET=int`、epoll 事件常量、6 个 API 签名；所有非 Linux 后端包含此文件 |
-| `epoll.c` | Linux 垫片 | 只实现 `epoll_allocator()`（空操作）和 `epoll_close()`（→ `close(2)`），其余直接走内核 |
-| `kepoll.c` | macOS/BSD kqueue 后端 | ~230 行，通过 `#include "uepoll.h"` 获取类型定义；kqueue fd 包装在 `struct epoll_t { int efd; epoll_lock_t lock; }` |
-| `uepoll.c` | POSIX select fallback | ~420 行，自唤醒 pipe + fd_set 轮询；线程安全 3 级降级锁（无 pthread fallback） |
-| `wepoll.c` | Windows IOCP 后端 | ~2185 行，第三方库 [piscisaureus/wepoll](https://github.com/piscisaureus/wepoll)，不展开 |
-| `wepoll.h` | Windows API 定义 | 独立定义所有类型/常量/签名，`HANDLE=void*`，`SOCKET=uintptr_t`，无 `_nouse` 字段 |
-| `main.c` | 测试套件 | 15 个 `EPOLL_TEST_FUNCTION` 宏定义的测试用例 |
-| `CMakeLists.txt` | 构建系统 | OS 条件编译 + 动态库/静态库 + 安装规则 |
-| `README.md` | 用户文档 | 平台/编译器支持、特性、限制、用法 |
-| `et_and_lt.md` | ET/LT 模式说明 | 边沿触发/水平触发补充文档 |
-| `LICENSE` | MIT 许可证 | — |
+| `epoll_create(int size)` | [`uepoll.h:70`](uepoll.h:70) / [`wepoll.h`](wepoll.h) | Create epoll instance; `size` is ignored (matches Linux 2.6.8+ behavior) |
+| `epoll_create1(int flags)` | [`uepoll.h:72`](uepoll.h:72) / [`wepoll.h`](wepoll.h) | Supports `EPOLL_CLOEXEC` |
+| `epoll_ctl(HANDLE, int op, SOCKET, struct epoll_event*)` | [`uepoll.h:76`](uepoll.h:76) / [`wepoll.h`](wepoll.h) | ADD / MOD / DEL operations |
+| `epoll_wait(HANDLE, struct epoll_event*, int maxevents, int timeout)` | [`uepoll.h:78`](uepoll.h:78) / [`wepoll.h`](wepoll.h) | Wait for events; `timeout=-1` blocks indefinitely |
+| `epoll_close(HANDLE)` | [`uepoll.h:74`](uepoll.h:74) / [`wepoll.h`](wepoll.h) | Release all resources |
+| `epoll_allocator(epoll_realloc_t)` | [`uepoll.h:68`](uepoll.h:68) / [`wepoll.h`](wepoll.h) | Replace internal `malloc`/`realloc`/`free` |
 
-## 公共 API（6 个函数，所有后端统一）
+## Backend-Specific Design Decisions
 
-| 函数 | 签名位置 | 语义 |
-|---|---|---|
-| `epoll_create(int size)` | [`uepoll.h:70`](uepoll.h:70) | 创建 epoll 实例，size 被忽略 |
-| `epoll_create1(int flags)` | [`uepoll.h:72`](uepoll.h:72) | 支持 `EPOLL_CLOEXEC` |
-| `epoll_ctl(HANDLE, int op, SOCKET, struct epoll_event*)` | [`uepoll.h:76`](uepoll.h:76) | ADD/MOD/DEL |
-| `epoll_wait(HANDLE, struct epoll_event*, int maxevents, int timeout)` | [`uepoll.h:78`](uepoll.h:78) | timeout=-1 无限等待 |
-| `epoll_close(HANDLE)` | [`uepoll.h:74`](uepoll.h:74) | 释放资源 |
-| `epoll_allocator(epoll_realloc_t)` | [`uepoll.h:68`](uepoll.h:68) | 替换内部 `malloc`/`realloc`/`free` |
+### epoll.c — Linux Native Shim
 
-## 各后端关键设计决策
+- [`epoll.c:5-7`](epoll.c:5): `epoll_allocator` is a no-op (`(void)alloc`) — no internal allocation on Linux.
+- [`epoll.c:9-11`](epoll.c:9): `epoll_close` directly calls `close(efd)`.
 
-### epoll.c — Linux 原生垫片
+### kepoll.c — kqueue Backend
 
-- [`epoll.c:5-7`](epoll.c:5)：`epoll_allocator` 是空操作（`(void)alloc`），因为 Linux 上无内部分配。
-- [`epoll.c:9-12`](epoll.c:9)：`epoll_close` 直接调用 `close(2)`。
+- **HANDLE is a pointer**: [`kepoll.c:54`](kepoll.c:54) `struct epoll_t` wraps a kqueue fd + spinlock. `epoll_create1` at [`kepoll.c:82-97`](kepoll.c:82) allocates this struct (with NULL check; closes kqueue fd on OOM).
+- **Event mapping** ([`kepoll.c:96-121`](kepoll.c:96)): `EPOLLIN|RDNORM|RDBAND → EVFILT_READ`, `EPOLLOUT|WRNORM|WRBAND → EVFILT_WRITE`. Non-requested filters are registered as `EV_DISABLE`.
+- **Event merging** ([`kepoll.c:162-197`](kepoll.c:162)): kqueue returns separate READ/WRITE events for the same fd. A `uintptr_t before_fd` cache merges adjacent same-fd events into a single `epoll_event`. ERROR/EOF events are handled separately and counted in the return value.
+- **ET mode** ([`kepoll.c:104-105`](kepoll.c:104)): `EPOLLET → EV_CLEAR` flag on kevent.
+- **ONESHOT handling** ([`kepoll.c:172-174`](kepoll.c:172)): After returning from `epoll_wait`, EV_ONESHOT events call `kepoll_del(ep, fd, false)` (DISABLE only, not DELETE).
+- **Thread safety** ([`kepoll.c:14-34`](kepoll.c:14)): 3-level degrading spinlock (C11 `atomic_flag` → GCC `__sync_*` → `#error`). No pthread fallback.
+- **Hardcoded maxevents**: [`kepoll.c:38`](kepoll.c:38) `#define EPOLL_MAX_EVENTS 1024`.
 
-### kepoll.c — kqueue 后端
+### uepoll.c — select Backend
 
-- **HANDLE 是指针**：[`kepoll.c:54`](kepoll.c:54) `struct epoll_t` 包装 kqueue fd + 自旋锁，`epoll_create1` 在 [`kepoll.c:82-97`](kepoll.c:82) 分配此结构体（含 NULL 检查 + OOM 时关闭 kqueue fd）。
-- **事件映射**：[`kepoll.c:96-121`](kepoll.c:96)：`EPOLLIN|RDNORM|RDBAND → EVFILT_READ`，`EPOLLOUT|WRNORM|WRBAND → EVFILT_WRITE`。
-- **事件合并**：[`kepoll.c:162-197`](kepoll.c:162)：kqueue 为同一 fd 返回分开的 READ/WRITE 事件，通过 `uintptr_t before_fd` 缓存将相邻同 fd 事件合并为一条 `epoll_event`。ERROR/EOF 事件单独处理并计入返回值。
-- **ET 模式**：[`kepoll.c:104-105`](kepoll.c:104)：`EPOLLET → EV_CLEAR` 标志。
-- **ONESHOT 处理**：[`kepoll.c:172-174`](kepoll.c:172)：`epoll_wait` 返回后对 EV_ONESHOT 事件调用 `kepoll_del(ep, fd, false)`（仅 DISABLE，不 DELETE）。
-- **线程安全**：[`kepoll.c:14-34`](kepoll.c:14)：3 级降级（C11 atomic_flag → GCC `__sync_*` → `#error`），无 pthread fallback。
-- **maxevents 硬编码 1024**：[`kepoll.c:38`](kepoll.c:38) `#define EPOLL_MAX_EVENTS 1024`。
+- **Core data structure** ([`uepoll.c:82-91`](uepoll.c:82)): `struct epoll_t` contains `nfds` + `pipes[2]` (self-waking pipe) + `epoll_lock_t` + three `fd_set`s + `epoll_event udata[FD_SETSIZE]`.
+- **fd = array index** ([`uepoll.c:90`](uepoll.c:90)): `udata[fd]` — this is why fd upper bound = `FD_SETSIZE` (default 1024 per [`uepoll.h:16-18`](uepoll.h:16)).
+- **Self-waking mechanism** ([`uepoll.c:80`](uepoll.c:80)): `epoll_notice` macro writes `"x"` (1 byte) to `pipes[1]` after `epoll_ctl` modifies the fd sets, waking any `epoll_wait` blocked in `select()`. [`uepoll.c:93-99`](uepoll.c:93) `epoll_receive` drains the pipe. The pipe read end (`pipes[0]`) is registered into the epoll instance itself during `epoll_create1` ([`uepoll.c:405`](uepoll.c:405)), and `epoll_wait` detects the wake via `FD_ISSET(ep->pipes[0], &rset)`.
+- **Thread safety 3-level degrading** ([`uepoll.c:23-43`](uepoll.c:23)):
+  - Level 0: `EPOLL_NO_THREADS` macro → no-ops
+  - Level 1: C11 `<stdatomic.h>` → `atomic_flag` TAS spinlock
+  - Level 2: GCC `__sync_*` builtins → spinlock
+  - If none available → `#error` compilation failure (no pthread fallback)
+- **ONESHOT handling** ([`uepoll.c:249-257`](uepoll.c:249)): After `epoll_wait` returns, the fd is removed from the `fd_set` (disabled, not deleted).
+- **fd type validation** ([`uepoll.c:121-126`](uepoll.c:121)): `uepoll_can_poll` only allows sockets, FIFOs, character devices, and regular files.
+- **EPOLLET unsupported**: The select model cannot simulate edge-triggered behavior.
+- **Timeout recalculation** ([`uepoll.c:227-231`](uepoll.c:227)): After a self-wake pipe interruption, `CLOCK_MONOTONIC_COARSE` (or fallbacks at [`uepoll.c:103-115`](uepoll.c:103)) recalculates remaining timeout.
 
-### uepoll.c — select 后端
+### wepoll.c — Windows IOCP Backend
 
-- **核心数据结构**：[`uepoll.c:82-91`](uepoll.c:82) `struct epoll_t`：`nfds` + `pipes[2]`（自唤醒）+ `epoll_lock_t` + 三组 `fd_set` + `epoll_event udata[FD_SETSIZE]`。
-- **fd 即数组下标**：[`uepoll.c:90`](uepoll.c:90) `udata[fd]` —— 这是 fd 上限 = `FD_SETSIZE`（典型 1024）的根本原因。
-- **自唤醒机制**：[`uepoll.c:80`](uepoll.c:80) `epoll_notice` 宏：`epoll_ctl` 修改集合后 `write(pipes[1], "x", 1)` 向管道写入 1 字节唤醒阻塞在 `select()` 中的 `epoll_wait`；[`uepoll.c:93-99`](uepoll.c:93) `epoll_receive` 排空 pipe。`epoll_create1` 将 pipe 读端（`pipes[0]`）注册到 epoll 实例中（[`uepoll.c:405`](uepoll.c:405)），`epoll_wait` 通过 `FD_ISSET(ep->pipes[0], &rset)` 检测唤醒。
-- **线程安全 3 级降级**：[`uepoll.c:23-43`](uepoll.c:23)：
-  - Level 0: `EPOLL_NO_THREADS` 宏 → 空操作
-  - Level 1: C11 `<stdatomic.h>` → `atomic_flag` TAS 自旋
-  - Level 2: GCC `__sync_*` 内置原子 → 自旋
-  - 如果以上皆不可用 → `#error` 编译失败（无 pthread fallback）
-- **ONESHOT 处理**：[`uepoll.c:249-257`](uepoll.c:249) `epoll_wait` 返回后从 `fd_set` 清除该 fd。
-- **fd 类型校验**：[`uepoll.c:121-126`](uepoll.c:121) `uepoll_can_poll`：仅允许 socket、FIFO、字符设备、普通文件。
-- **不支持 EPOLLET**：select 模型无法模拟边沿触发。
-- **超时重算**：[`uepoll.c:227-231`](uepoll.c:227)：被自唤醒 pipe 打断后，用 `CLOCK_MONOTONIC_COARSE` 重新计算剩余超时（[`uepoll.c:103-115`](uepoll.c:103) 时间源选择）。
+- Third-party library ([piscisaureus/wepoll](https://github.com/piscisaureus/wepoll)); not directly maintained here.
+- Only supports `SOCKET`/`Pipe` — regular files are unsupported.
+- `HANDLE = void*`, `SOCKET = uintptr_t` ([`wepoll.h:69-70`](wepoll.h:69)).
+- `epoll_event` has **no `_nouse` field** ([`wepoll.h:78-81`](wepoll.h:78)), unlike the uepoll variant.
 
-### wepoll.c — Windows IOCP 后端
+## Supported Platforms & Compilers
 
-- 第三方库，不直接维护。只支持 `SOCKET`/`Pipe`，不支持普通文件。
-- `HANDLE = void*`，`SOCKET = uintptr_t`（[`wepoll.h:69-70`](wepoll.h:69)）。
-- `epoll_event` 结构无 `_nouse` 字段（[`wepoll.h:78-81`](wepoll.h:78)），与 uepoll 不同。
-
-## 支持平台与编译器
-
-| 平台 | CMake 匹配 | 预处理器 | 后端 | 机制 |
+| Platform | CMake Match | Preprocessor | Backend | Mechanism |
 |---|---|---|---|---|
-| **Linux** | `Linux` | `__linux__` | `epoll.c` | 内核 epoll |
-| **Android** | `Android` | `__ANDROID__` | `epoll.c` | 内核 epoll |
+| **Linux** | `Linux` | `__linux__` | `epoll.c` | Kernel epoll |
+| **Android** | `Android` | `__ANDROID__` | `epoll.c` | Kernel epoll |
 | **Windows** | `Windows` | `WIN32` | `wepoll.c` | IOCP + NT API |
 | **macOS** | `Darwin` | fallback | `kepoll.c` | kqueue/kevent |
-| **FreeBSD** / **OpenBSD** / **NetBSD** | `BSD` | fallback | `kepoll.c` | kqueue/kevent |
-| **其他 POSIX** (Solaris, AIX, QNX, Haiku 等) | `else()` | fallback | `uepoll.c` | select |
+| **FreeBSD / OpenBSD / NetBSD** | `BSD` | fallback | `kepoll.c` | kqueue/kevent |
+| **Other POSIX** (Solaris, AIX, QNX, Haiku, etc.) | `else()` | fallback | `uepoll.c` | select |
 
-- **编译器**：MSVC / GCC / Clang
-- **C 标准**：不强制指定（新版编译器默认 C11/C17）。最低需求 C99（`for` 循环内声明、`<stdbool.h>`、`//` 注释）。若 `<stdatomic.h>` 可用则自动启用 C11 原子操作（[`kepoll.c:21`](kepoll.c:21) / [`uepoll.c:29`](uepoll.c:29) 检查 `__STDC_VERSION__ >= 201112L`），否则回退到 GCC `__sync_*` 内置原子。
-- **架构**：32/64-bit 均支持。`HANDLE` 类型随指针宽度自适应（`intptr_t` / `void*`），无内联汇编或边端序假设。
+**Compilers:** MSVC / GCC / Clang  
+**C Standard:** Not forced; modern compilers default to C11/C17. Minimum requirement is C99 (`for`-loop declarations, `<stdbool.h>`, `//` comments). C11 atomics auto-detected via `__STDC_VERSION__ >= 201112L` ([`kepoll.c:21`](kepoll.c:21) / [`uepoll.c:29`](uepoll.c:29)), with GCC `__sync_*` fallback.  
+**Architecture:** 32/64-bit. `HANDLE` adapts to pointer width (`intptr_t` / `void*`). No inline assembly or endianness assumptions.
 
-## 构建与测试
+## Build & Test
 
-### 构建
+### Build
 
 ```bash
-mkdir build && cd build
-cmake ..
-cmake --build .
+cmake -S . -B build
+cmake --build build
 ```
 
-CMake 按 `CMAKE_SYSTEM_NAME` 选择后端（[`CMakeLists.txt:15-32`](CMakeLists.txt:15)）：
-- Windows → `wepoll.c`
-- Linux/Android → `epoll.c`
-- BSD/Darwin → `kepoll.c`
-- 其他 → `uepoll.c`
+CMake selects the backend by `CMAKE_SYSTEM_NAME` ([`CMakeLists.txt`](CMakeLists.txt)):
+- Windows → `src/wepoll.c`
+- Linux/Android → `src/epoll.c`
+- BSD/Darwin → `src/kepoll.c`
+- Other → `src/uepoll.c`
 
-产物：动态库 `libepoll.so`/`.dylib`/`.dll` + 静态库 `libepoll.a`/`.lib` + 可执行测试 `main`。
+**Build artifacts:** shared library (`libepoll.so`/`.dylib`/`.dll`) + static library (`libepoll.a`/`.lib`) + test executable (`build/main`).
 
-### 测试
+Install headers to `${CMAKE_INSTALL_INCLUDEDIR}/epoll/` and libraries to `${CMAKE_INSTALL_LIBDIR}`.
+
+### Test
 
 ```bash
 ./build/main
 ```
 
-15 个测试用例（[`main.c:16-253`](main.c:16)），`EPOLL_TEST_FUNCTION` 宏自动编号并打印结果。
+### CI (GitHub Actions)
 
-ET 模式测试（`testcase_epoll_et_mode`）被注释掉（[`main.c:250`](main.c:250)），因为 select 后端不支持。
+`.github/workflows/ci.yml` builds and tests all four backends × compilers on every push/PR:
 
-## 编码约定
+| Job | OS | Backend | Compiler |
+|---|---|---|---|
+| `linux-gcc` | ubuntu-latest | `src/epoll.c` (kernel epoll) | GCC |
+| `linux-clang` | ubuntu-latest | `src/epoll.c` (kernel epoll) | Clang |
+| `linux-select` | ubuntu-latest | `src/uepoll.c` (select fallback) | GCC |
+| `macos-clang` | macos-latest | `src/kepoll.c` (kqueue) | Clang |
+| `windows-msvc` | windows-latest | `src/wepoll.c` (IOCP) | MSVC |
+| `windows-clang` | windows-latest | `src/wepoll.c` (IOCP) | ClangCL |
+| `windows-mingw` | windows-latest | `src/wepoll.c` (IOCP) | MinGW-w64 (GCC) |
 
-- **C 标准**：不强制指定，由编译器默认决定（通常 C11 或更新）。最低兼容 C99。
-- **命名前缀**：uepoll 内部函数以 `uepoll_` 为前缀；kepoll 内部函数以 `kepoll_` 或 `_kepoll_` 为前缀。
-- **锁宏抽象**：`epoll_spinlock_init/lock/unlock` 宏统一接口，底层实现由编译时条件选择。
-- **内存分配**：所有内部分配走 `epoll_realloc` 函数指针（默认 `realloc`），可通过 `epoll_allocator()` 替换（[`uepoll.c:100`](uepoll.c:100)）。
-- **错误处理**：返回 `-1` 并设 `errno`（`EBADF`、`EINVAL`、`ENOENT`、`EEXIST`、`ENOMEM`、`EPERM`、`EFAULT`、`ENOSPC`）。
-- **平台隔离**：`#ifndef WIN32` 守卫平台特有代码（如 `main.c` 中 pipe/socketpair 测试）。
-- **`HANDLE` 类型因平台而异**：Linux=`int`，Windows=`void*`，其他=`intptr_t`。代码中对 `HANDLE` 做强转为 `struct epoll_t*` 是刻意的。
+15 active test cases registered in `main()` ([`main.c:268-283`](main.c:268)):
+1. `testcase_epoll_timer` — epoll_wait timeout accuracy
+2. `testcase_epoll_alloc` — rapid create/close (100k iterations)
+3. `testcase_epoll_watch` — basic EPOLLIN watch on pipe
+4. `testcase_epoll_repeat` — 100k repeated epoll_wait with persistent data
+5. `testcase_epoll_oneshot` — EPOLLONESHOT disables after first trigger
+6. `testcase_epoll_ctl_del` — delete then verify fd no longer watched
+7. `testcase_epoll_ctl_mod` — modify data.ptr mid-stream
+8. `testcase_epoll_out` — EPOLLOUT on writable pipe
+9. `testcase_epoll_multi_fd` — two pipes both readable
+10. `testcase_epoll_ctl_error` — invalid arguments to epoll_ctl/wait
+11. `testcase_epoll_hup` — close peer, verify epoll_close works
+12. `testcase_epoll_infinite` — timeout=-1 blocks until data arrives
+13. `testcase_epoll_data_ptr` — data.ptr round-trips correctly
+14. `testcase_epoll_create1_flag` — EPOLL_CLOEXEC flag
+15. `testcase_epoll_merge` — EPOLLIN|EPOLLOUT on same fd merges to 1 event
 
-## 常见陷阱
+`testcase_epoll_et_mode` ([`main.c:250`](main.c:250)) is **commented out** because the select backend does not support EPOLLET. Platform-specific code is guarded with `#ifndef WIN32`.
 
-1. **`epoll_event` 布局不同**：uepoll 的 `epoll_event` 有 `_nouse` 内部字段（[`uepoll.h:58`](uepoll.h:58)），wepoll 没有。跨后端共享二进制数据不安全。
-2. **fd 上限**：uepoll（select）后端受 `FD_SETSIZE` 限制（默认 1024，[`uepoll.h:12`](uepoll.h:12)）。kepoll 有 `EPOLL_MAX_EVENTS=1024` 的硬编码限制（[`kepoll.c:38`](kepoll.c:38)）。
-3. **ET 模式不可移植**：select 后端不支持 `EPOLLET`。README 明确标注此限制。
-4. **wepoll 只支持 SOCKET/Pipe**：不能对普通文件描述符使用 epoll。
-5. **kepoll 事件合并**：`epoll_wait` 的 `maxevents` 必须 ≥ kqueue 实际返回的事件数，否则合并逻辑可能截断（见 [`main.c:227`](main.c:227) 测试注释）。
-6. **`epoll_create` 的 size 参数被忽略**：与 Linux 2.6.8+ 行为一致，但老代码可能依赖。
-7. **kepoll 的 `epoll_close`** 在 `efd <= 0` 时返回 -1（[`kepoll.c:72-73`](kepoll.c:72)），而 Linux 垫片直接调用 `close(efd)`（[`epoll.c:11`](epoll.c:11)），行为略有不同。
-8. **自唤醒 pipe fd 占用**：pipe 读端 `pipes[0]` 被注册进 epoll 实例本身（[`uepoll.c:405`](uepoll.c:405)），因此多线程下 `epoll_ctl` 修改 fd 集合后会通过管道唤醒 `epoll_wait` 使其重新计算超时后重入 `select()`。注意 `epoll_notice` 写 1 字节到 `pipes[1]`，需确保管道缓冲区不会被写满。
+## Coding Conventions
 
-## 修改指南
+- **C Standard:** Not forced; compiler default (typically C11 or newer). Minimum C99 compatibility.
+- **Naming:** uepoll internal functions prefixed with `uepoll_`; kepoll internal functions prefixed with `kepoll_` or `_kepoll_`.
+- **Spinlock abstraction:** `epoll_spinlock_init/lock/unlock` macros provide a uniform interface, with compile-time selection of the backing implementation.
+- **Memory allocation:** All internal allocations go through the `epoll_realloc` function pointer (defaults to `realloc`), replaceable via `epoll_allocator()` ([`uepoll.c:100`](uepoll.c:100)).
+- **Error handling:** Return `-1` and set `errno` (`EBADF`, `EINVAL`, `ENOENT`, `EEXIST`, `ENOMEM`, `EPERM`, `EFAULT`, `ENOSPC`).
+- **Platform isolation:** `#ifndef WIN32` guards platform-specific code (e.g., pipe/socketpair tests in `main.c`).
+- **`HANDLE` type varies by platform:** Linux=`int`, Windows=`void*`, others=`intptr_t`. Casting `HANDLE` to `struct epoll_t*` in the code is intentional.
 
-- **添加新后端**：创建 `new_backend.c`，在 `epoll.h` 添加 `#elif` 分支，在 `CMakeLists.txt` 添加 `elseif` 构建规则。
-- **添加新 API**：在所有四个后端的头文件（`epoll.h` Linux 段、`wepoll.h`、`uepoll.h`）中同步添加签名，在所有四个 `.c` 文件中实现。
-- **修改事件常量**：需同步 `uepoll.h` 和 `wepoll.h` 中的 `enum EPOLL_EVENTS` 及对应的 `#define` 宏。
-- **测试**：新功能必须在 `main.c` 添加 `EPOLL_TEST_FUNCTION` 测试用例，并用 `#ifndef WIN32` 等守卫平台特定代码。
+## Common Pitfalls
+
+1. **`epoll_event` layout differs across backends:** uepoll's `epoll_event` has an internal `_nouse` field ([`uepoll.h:58`](uepoll.h:58)); wepoll does not ([`wepoll.h:78-81`](wepoll.h:78)). Binary sharing of event structs between backends is unsafe.
+2. **fd upper bound:** The uepoll (select) backend is limited by `FD_SETSIZE` (default 1024, [`uepoll.h:16-18`](uepoll.h:16)). kepoll has a hardcoded `EPOLL_MAX_EVENTS=1024` ([`kepoll.c:38`](kepoll.c:38)).
+3. **ET mode is non-portable:** The select backend does not support `EPOLLET`. The README explicitly documents this limitation.
+4. **wepoll only supports SOCKET/Pipe:** Regular file descriptors cannot be used with epoll on Windows.
+5. **kepoll event merging requires sufficient maxevents:** `epoll_wait`'s `maxevents` must be ≥ the actual number of kqueue events returned, otherwise the merge logic may truncate (see [`main.c:227`](main.c:227) test comment).
+6. **`epoll_create`'s `size` parameter is ignored:** Matches Linux 2.6.8+ behavior, but legacy code may depend on it.
+7. **`epoll_close` behavior differs:** kepoll returns `-1` when `efd <= 0` ([`kepoll.c:72-73`](kepoll.c:72)); the Linux shim calls `close(efd)` directly ([`epoll.c:11`](epoll.c:11)).
+8. **Self-waking pipe fd consumption:** The pipe read end (`pipes[0]`) is registered in the epoll instance itself ([`uepoll.c:405`](uepoll.c:405)). In multi-threaded scenarios, `epoll_ctl` modifications write 1 byte to `pipes[1]` to wake `epoll_wait`. Ensure the pipe buffer is not overfilled by rapid modifications.
+
+## Modification Guide
+
+- **Adding a new backend:** Create `new_backend.c`, add an `#elif` branch in `epoll.h`, add an `elseif` build rule in `CMakeLists.txt`.
+- **Adding a new API:** Add the signature in all relevant headers (the Linux section of `epoll.h`, `wepoll.h`, `uepoll.h`) and implement in all backend `.c` files.
+- **Modifying event constants:** Synchronize `enum EPOLL_EVENTS` and the corresponding `#define` macros in both `uepoll.h` and `wepoll.h`.
+- **Testing:** Add a new `EPOLL_TEST_FUNCTION` test case in `main.c`. Guard platform-specific code with `#ifndef WIN32`.

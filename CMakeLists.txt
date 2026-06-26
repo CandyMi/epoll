@@ -5,65 +5,62 @@ message("Author  Email  : 869646063@qq.com")
 message("Author  Github : github.com/CandyMi")
 message("======================================")
 
-# 最低版本号
 cmake_minimum_required(VERSION 3.10)
 
-# 项目名称
 project("epoll")
 
-# 不强制指定 C 标准：新版编译器（GCC 5+ / Clang 3.3+ / MSVC 2015+）
-# 默认使用 C11 或更新标准，代码通过 __STDC_VERSION__ 自适应。
-# 最低需求 C99（for 循环内声明、stdbool.h、// 注释）。
+# C standard not forced — modern compilers default to C11/C17.
+# Minimum C99 (for-loop decl, stdbool.h, // comments).
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
 
-add_executable(main main.c)
+# ── Include path ──────────────────────────────
+# Public so consumers (and test) get the header search path
+add_library(epoll INTERFACE)
+target_include_directories(epoll INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/epoll>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/epoll>)
+
+# ── Backend selection ──────────────────────────
+add_executable(main test/main.c)
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-  # MESSAGE("Windows")
-  file(GLOB epoll_src wepoll.c)
-  add_library(epoll_dynamic SHARED ${epoll_src})
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "" )
-  add_library(epoll_static STATIC ${epoll_src})
-  set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
-  target_link_libraries(main PRIVATE epoll_static)
+  file(GLOB epoll_src src/wepoll.c)
 elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
-  file(GLOB epoll_src epoll.c)
-  add_library(epoll_dynamic SHARED ${epoll_src})
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  add_library(epoll_static STATIC ${epoll_src})
-  set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  target_link_libraries(main PRIVATE epoll_static)
+  file(GLOB epoll_src src/epoll.c)
 elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|Darwin")
-  # MESSAGE("*BSD|Darwin")
-  file(GLOB epoll_src kepoll.c)
-  add_library(epoll_dynamic SHARED ${epoll_src})
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  add_library(epoll_static STATIC ${epoll_src})
-  set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  target_link_libraries(main PRIVATE epoll_static)
+  file(GLOB epoll_src src/kepoll.c)
 else()
-  # MESSAGE("Unix-Like")
-  file(GLOB epoll_src uepoll.c)
-  add_library(epoll_dynamic SHARED ${epoll_src})
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  add_library(epoll_static STATIC ${epoll_src})
-  set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  target_link_libraries(main PRIVATE epoll_static)
+  file(GLOB epoll_src src/uepoll.c)
 endif()
+
+add_library(epoll_dynamic SHARED ${epoll_src})
+add_library(epoll_static STATIC ${epoll_src})
+
+if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
+  set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
+else()
+  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
+  set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
+endif()
+
+target_link_libraries(epoll_dynamic PRIVATE epoll)
+target_link_libraries(epoll_static PUBLIC epoll)
+target_link_libraries(main PRIVATE epoll_static)
 
 find_file(EPOLL_ATOMIC NAMES stdatomic.h)
 if (EPOLL_ATOMIC)
   target_compile_definitions(epoll_dynamic PRIVATE EPOLL_USE_ATOMIC=1)
   target_compile_definitions(epoll_static PRIVATE EPOLL_USE_ATOMIC=1)
-endif(EPOLL_ATOMIC)
+endif()
 
-# ── 安装规则 ──────────────────────────────
+# ── Install rules ─────────────────────────────
 include(GNUInstallDirs)
 
-install(TARGETS epoll_static epoll_dynamic
+install(TARGETS epoll_static epoll_dynamic epoll
         EXPORT epoll-targets
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
-install(FILES epoll.h uepoll.h wepoll.h
+install(FILES include/epoll/epoll.h include/epoll/uepoll.h include/epoll/wepoll.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/epoll)

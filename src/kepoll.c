@@ -8,7 +8,7 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/event.h>
-#include <alloca.h>
+// alloca removed — kqevents now lives on the heap
 
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
@@ -48,12 +48,21 @@ struct epoll_t
 {
   int efd;
   epoll_lock_t lock;
+  struct kevent *kqevents;      /* heap-allocated kevent buffer, sized EPOLL_MAX_EVENTS */
 };
 
 static epoll_realloc_t epoll_realloc = realloc;
 void epoll_allocator(epoll_realloc_t alloc)
 {
   epoll_realloc = alloc;
+}
+
+static inline int kepoll_ensure_kqevents(struct epoll_t *ep) {
+  if (!ep->kqevents) {
+    ep->kqevents = (struct kevent*)epoll_malloc(sizeof(struct kevent) * EPOLL_MAX_EVENTS);
+    if (!ep->kqevents) return -1;
+  }
+  return 0;
 }
 
 int epoll_close(HANDLE efd)
@@ -63,6 +72,8 @@ int epoll_close(HANDLE efd)
   struct epoll_t* ep = (struct epoll_t*)efd;
   if (ep->efd <= 0)
     return -1;
+  epoll_free(ep->kqevents);
+  ep->kqevents = NULL;
   close(ep->efd);
   epoll_free(ep);
   return 0;
@@ -91,13 +102,26 @@ HANDLE epoll_create1(int flags)
     close(efd);
     return -1;
   }
-  ep->efd = efd; epoll_spinlock_init(&ep->lock);
+  ep->efd = efd;
+  ep->kqevents = NULL;
+  epoll_spinlock_init(&ep->lock);
+  /* pre-allocate kevent buffer to avoid alloca on every epoll_wait */
+  if (kepoll_ensure_kqevents(ep) != 0) {
+    errno = ENOMEM;
+    close(efd);
+    epoll_free(ep);
+    return -1;
+  }
   return (HANDLE)ep;
 }
 
 static inline
 int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, bool first)
 {
+  if (!event) {
+    errno = EFAULT;
+    return EPOLL_INVALID;
+  }
   epoll_spinlock_lock(&ep->lock);
   int efd = ep->efd;
   errno = 0; struct kevent ev[3];
@@ -217,7 +241,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     // printf("struct timespec = {%ld, %ld}\n", ts.tv_sec, ts.tv_nsec);
   }
 
-  struct kevent *kqevents = (struct kevent*)alloca(sizeof(struct kevent) * maxevents);
+  struct kevent *kqevents = ep->kqevents;
   struct epoll_event *ev;
   int nevents = kevent(ep->efd, NULL, 0, kqevents, maxevents, tsp);
   // printf("nevents = %d\n", nevents);
