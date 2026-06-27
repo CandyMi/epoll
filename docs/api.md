@@ -299,7 +299,7 @@ typedef struct epoll_event {
 | `EPOLLIN` | `0x001` | Data available to read | All |
 | `EPOLLOUT` | `0x004` | Ready for writing | All |
 | `EPOLLERR` | `0x008` | Error condition on fd | All |
-| `EPOLLHUP` | `0x010` | Hang up (peer closed) | **Linux only**; kqueue/select don't emulate this |
+| `EPOLLHUP` | `0x010` | Hang up (peer closed) | **kqueue + Linux**; select doesn't emulate this |
 | `EPOLLRDHUP` | `0x2000` | Peer closed connection (TCP half-close) | **Linux only** |
 | `EPOLLPRI` | `0x002` | Urgent data available | Linux, kqueue |
 | `EPOLLRDNORM` | `0x040` | Normal data readable (alias for `EPOLLIN`) | All |
@@ -417,7 +417,7 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 |---|---|---|---|---|
 | Max fds | Kernel limit | 1024 (`EPOLL_MAX_EVENTS`) | System limit | 1024 (`FD_SETSIZE`) |
 | `EPOLLET` | ✅ | ✅ (→ `EV_CLEAR`) | ❌ | ❌ |
-| `EPOLLHUP` | ✅ | ❌ (EV_EOF → `EPOLLERR` only) | ❌ | ❌ |
+| `EPOLLHUP` | ✅ | ✅ (EV_EOF → `EPOLLHUP`) | ❌ | ❌ |
 | `EPOLLRDHUP` | ✅ | ❌ | ❌ | ❌ |
 | `EPOLLONESHOT` | ✅ | ✅ (→ `EV_ONESHOT`) | ✅ | ✅ |
 | Non-socket fds | ✅ | ✅ | ❌ (sockets/pipes only) | ✅ |

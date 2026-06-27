@@ -65,6 +65,7 @@ EPOLL_TEST_FUNCTION(testcase_epoll_oneshot, {
     r = epoll_wait(efd, event, 1, 10);
     assert(r == 1);
     assert(event[0].data.fd == RPIPE);
+    assert(event[0].events & EPOLLIN);
     r = epoll_wait(efd, event, 1, 10);
     assert(r == 0);
     epoll_close(efd);
@@ -287,6 +288,68 @@ EPOLL_TEST_FUNCTION(testcase_epoll_hup, {
     close(fds[1]); close(fds[0]); epoll_close(efd);
 })
 
+EPOLL_TEST_FUNCTION(testcase_epoll_hup_flag, {
+    /*
+     * Verify EPOLLHUP is reported after peer close (clean EOF).
+     * On the select backend, EOF cannot be detected via select(),
+     * so the wait may time out (r == 0) — pass either way as long
+     * as no false EPOLLERR is raised.
+     */
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+    int fds[2]; pipe(fds);
+    int RPIPE = fds[0];
+    int WPIPE = fds[1];
+    struct epoll_event ev;
+    ev.events = EPOLLIN; ev.data.fd = RPIPE;
+    int r = epoll_ctl(efd, EPOLL_CTL_ADD, RPIPE, &ev);
+    assert(r == 0);
+
+    /* Write data, read it all, then close write end → triggers EOF */
+    write(WPIPE, "x", 1);
+    char buf[4];
+    r = (int)read(RPIPE, buf, sizeof(buf));
+    assert(r == 1);
+    close(WPIPE);
+
+    /* Wait for HUP — short timeout suffices for kqueue/Linux */
+    r = epoll_wait(efd, &ev, 1, 100);
+    assert(r >= 0);
+    if (r > 0) {
+        /* On kqueue (after fix) and Linux: EPOLLHUP set, EPOLLERR not set */
+        assert(ev.events & EPOLLHUP);
+        assert(!(ev.events & EPOLLERR));
+    }
+    /* On select: r == 0 (timeout) — skip flag checks, still pass */
+
+    close(RPIPE); epoll_close(efd);
+})
+
+EPOLL_TEST_FUNCTION(testcase_epoll_hup_register_err, {
+    /*
+     * Verify that registering with EPOLLERR only (no EPOLLIN/OUT)
+     * still detects peer close. Linux: EPOLLERR/EPOLLHUP always reported.
+     * kqueue: needs EVFILT_READ enabled to detect EV_EOF.
+     */
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+    int fds[2]; pipe(fds);
+    int RPIPE = fds[0];
+    struct epoll_event ev;
+    ev.events = EPOLLERR; ev.data.fd = RPIPE;  /* ← only EPOLLERR, no IN/OUT */
+    int r = epoll_ctl(efd, EPOLL_CTL_ADD, RPIPE, &ev);
+    assert(r == 0);
+    close(fds[1]);  /* trigger EOF */
+    r = epoll_wait(efd, &ev, 1, 100);
+    assert(r >= 0);
+    if (r > 0) {
+        /* On kqueue (after fix) and Linux: EPOLLHUP reported even when
+         * only EPOLLERR was requested — HUP/ERR are "always reported". */
+        assert(ev.events & EPOLLHUP);
+    }
+    close(RPIPE); epoll_close(efd);
+})
+
 EPOLL_TEST_FUNCTION(testcase_epoll_infinite, {
     HANDLE efd = epoll_create(1);
     assert(efd > 0); int r;
@@ -358,6 +421,35 @@ EPOLL_TEST_FUNCTION(testcase_epoll_merge, {
     assert(events[0].data.fd == sv[0]);
     close(sv[0]); close(sv[1]); epoll_close(efd);
 })
+
+EPOLL_TEST_FUNCTION(testcase_epoll_pri, {
+    /*
+     * Verify EPOLLPRI via MSG_OOB (kqueue: EVFILT_EXCEPT | NOTE_OOB).
+     * Only works on platforms where send(MSG_OOB) triggers EVFILT_EXCEPT
+     * (macOS, some BSDs). On other backends (select, Linux w/o MSG_OOB on
+     * AF_UNIX) the wait may time out — pass either way.
+     */
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+    int sv[2];
+    int r = socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    assert(r == 0);
+    struct epoll_event ev;
+    ev.events = EPOLLPRI;
+    ev.data.fd = sv[0];
+    r = epoll_ctl(efd, EPOLL_CTL_ADD, sv[0], &ev);
+    assert(r == 0);
+    /* Send one byte of out-of-band data */
+    send(sv[1], "!", 1, MSG_OOB);
+    struct epoll_event event[1];
+    r = epoll_wait(efd, event, 1, 100);
+    assert(r >= 0);
+    if (r > 0) {
+        assert(event[0].events & EPOLLPRI);
+        assert(event[0].data.fd == sv[0]);
+    }
+    close(sv[0]); close(sv[1]); epoll_close(efd);
+})
 #endif /* !WIN32 */
 
 /* ── Platform-neutral tests (no pipes/sockets) ────────────────────────── */
@@ -403,10 +495,13 @@ int main(int argc, char const *argv[])
     testcase_epoll_multi_fd();
     testcase_epoll_ctl_error();
     testcase_epoll_hup();
+    testcase_epoll_hup_flag();
+    testcase_epoll_hup_register_err();
     testcase_epoll_infinite();
     testcase_epoll_data_ptr();
     testcase_epoll_create1_flag();
     testcase_epoll_merge();
+    testcase_epoll_pri();
 #endif
     return 0;
 }

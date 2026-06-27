@@ -54,6 +54,7 @@ struct epoll_t
 static epoll_realloc_t epoll_realloc = realloc;
 void epoll_allocator(epoll_realloc_t alloc)
 {
+  if (!alloc) return;
   epoll_realloc = alloc;
 }
 
@@ -134,8 +135,8 @@ int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, b
   if (events & EPOLLET) // 模拟`ET`模式
     exflags |= EV_CLEAR;
   // printf("events & EPOLLET = 0x%08x, flags = 0x%04x\n", events & EPOLLET, exflags);
-  /* 读事件 */
-  if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND)) {
+  /* 读事件 — EPOLLERR/EPOLLHUP 也需要启用 EVFILT_READ 才能检测到 EOF/错误 */
+  if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND | EPOLLERR | EPOLLHUP)) {
     filter = EVFILT_READ; flags = add | EV_ENABLE | exflags;
     EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
   } else {
@@ -150,10 +151,21 @@ int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, b
     filter = EVFILT_WRITE; flags = add | EV_DISABLE;
     EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
   }
-  /* 注册事件 */
+  /* 注册事件 (READ + WRITE) — 单独注册 EXCEPT 以隔离 pipe 不支持的 EINVAL */
   int r = kevent(efd, ev, nevent, NULL, 0, NULL);
-  // if (r) perror("kepoll_add");
   epoll_spinlock_unlock(&ep->lock);
+  /* 异常/带外事件 — EPOLLPRI → EVFILT_EXCEPT (NOTE_OOB)
+   * 单独 kevent 调用, 忽略错误 (pipe 等 fd 不支持 EVFILT_EXCEPT) */
+  if (events & EPOLLPRI) {
+    struct kevent except_ev;
+    EV_SET(&except_ev, fd, EVFILT_EXCEPT, EV_ADD | EV_ENABLE | exflags, NOTE_OOB, 0, udata);
+    (void)kevent(efd, &except_ev, 1, NULL, 0, NULL);
+  } else if (!first) {
+    /* MOD 移除 EPOLLPRI — 尝试删除 EVFILT_EXCEPT, 忽略错误 */
+    struct kevent except_ev;
+    EV_SET(&except_ev, fd, EVFILT_EXCEPT, EV_DELETE, 0, 0, 0);
+    (void)kevent(efd, &except_ev, 1, NULL, 0, NULL);
+  }
   return r;
 }
 
@@ -257,12 +269,27 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     {
       uint16_t flags = kqevents[i].flags;
       if (flags & EV_ONESHOT) {
+        /* ONESHOT 事件先输出到 events[]，再清理内部状态 */
+        ev = &events[i];
+        ev->events = 0;
+        if (flags & EV_ERROR) ev->events |= EPOLLERR;
+        if (flags & EV_EOF)   ev->events |= EPOLLHUP;
+        if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
+        if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
+        ev->data.ptr = kqevents[i].udata;
+        nkqevents++;
         kepoll_del(ep, kqevents[i].ident, false);
+        continue;
       } else if (flags & EV_ERROR || flags & EV_EOF) {
         // printf("EV_ERROR | EV_EOF %ld, 0x%08x\n", kqevents[i].ident, flags);
         kepoll_del(ep, kqevents[i].ident, false);
         ev = &events[i];
-        ev->events = EPOLLERR;
+        /* EV_EOF = peer clean close → EPOLLHUP
+         * EV_ERROR = kevent system error → EPOLLERR
+         * both = abnormal disconnect → EPOLLHUP | EPOLLERR */
+        ev->events = 0;
+        if (flags & EV_ERROR) ev->events |= EPOLLERR;
+        if (flags & EV_EOF)   ev->events |= EPOLLHUP;
         if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
         if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
         ev->data.ptr = kqevents[i].udata;
@@ -294,6 +321,11 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         case EVFILT_WRITE:
         {
           ev->events |= EPOLLOUT;
+          break;
+        }
+        case EVFILT_EXCEPT:
+        {
+          ev->events |= EPOLLPRI;
           break;
         }
       }
