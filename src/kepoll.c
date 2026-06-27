@@ -158,7 +158,9 @@ int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, b
   int r = kevent(efd, ev, nevent, NULL, 0, NULL);
   epoll_spinlock_unlock(&ep->lock);
   /* 异常/带外事件 — EPOLLPRI → EVFILT_EXCEPT (NOTE_OOB)
-   * 单独 kevent 调用, 忽略错误 (pipe 等 fd 不支持 EVFILT_EXCEPT) */
+   * 单独 kevent 调用, 忽略错误 (pipe 等 fd 不支持 EVFILT_EXCEPT).
+   * EVFILT_EXCEPT/NOTE_OOB 不是所有 BSD 变种都支持, 用 #ifdef 防护. */
+#if defined(EVFILT_EXCEPT) && defined(NOTE_OOB)
   if (events & EPOLLPRI) {
     struct kevent except_ev;
     EV_SET(&except_ev, fd, EVFILT_EXCEPT, EV_ADD | EV_ENABLE | exflags, NOTE_OOB, 0, udata);
@@ -169,6 +171,7 @@ int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, b
     EV_SET(&except_ev, fd, EVFILT_EXCEPT, EV_DELETE, 0, 0, 0);
     (void)kevent(efd, &except_ev, 1, NULL, 0, NULL);
   }
+#endif
   return r;
 }
 

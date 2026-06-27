@@ -301,7 +301,7 @@ typedef struct epoll_event {
 | `EPOLLERR` | `0x008` | Error condition on fd | All |
 | `EPOLLHUP` | `0x010` | Hang up (peer closed) | **kqueue + Linux**; select doesn't emulate this |
 | `EPOLLRDHUP` | `0x2000` | Peer closed connection (TCP half-close) | **Linux only** |
-| `EPOLLPRI` | `0x002` | Urgent data available | Linux, kqueue |
+| `EPOLLPRI` | `0x002` | Urgent data available | Linux, macOS (kqueue EVFILT_EXCEPT) |
 | `EPOLLRDNORM` | `0x040` | Normal data readable (alias for `EPOLLIN`) | All |
 | `EPOLLRDBAND` | `0x080` | Priority band data readable | All |
 | `EPOLLWRNORM` | `0x100` | Normal data writable (alias for `EPOLLOUT`) | All |
@@ -419,6 +419,7 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 | `EPOLLET` | ✅ | ✅ (→ `EV_CLEAR`) | ❌ | ❌ |
 | `EPOLLHUP` | ✅ | ✅ (EV_EOF → `EPOLLHUP`) | ❌ | ❌ |
 | `EPOLLRDHUP` | ✅ | ❌ | ❌ | ❌ |
+| `EPOLLPRI` | ✅ | ✅ macOS only (EVFILT_EXCEPT) | ❌ | ❌ |
 | `EPOLLONESHOT` | ✅ | ✅ (→ `EV_ONESHOT`) | ✅ | ✅ |
 | Non-socket fds | ✅ | ✅ | ❌ (sockets/pipes only) | ✅ |
 | `epoll_event._nouse` | N/A | N/A | ❌ (no such field) | ✅ (internal) |
