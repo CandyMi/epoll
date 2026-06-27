@@ -33,9 +33,9 @@
   #define uepoll_use_spinlock 1
   #include <stdatomic.h>
   typedef atomic_flag epoll_lock_t;
-  #define epoll_spinlock_init(lock)       atomic_flag_clear((lock))
-  #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set((lock)) == 1)
-  #define epoll_spinlock_unlock(lock)     atomic_flag_clear((lock))
+  #define epoll_spinlock_init(lock)       atomic_flag_clear_explicit((lock), memory_order_release)
+  #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set_explicit((lock), memory_order_acquire))
+  #define epoll_spinlock_unlock(lock)     atomic_flag_clear_explicit((lock), memory_order_release)
 #elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) || \
        defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) || \
        defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || \
