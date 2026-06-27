@@ -41,7 +41,10 @@
 
 #define EPOLL_INVALID (-1)
 #define EPOLLEMPTY (0)
-#define EPOLL_MAX_EVENTS 1024
+
+#ifndef EPOLL_MAX_EVENTS
+  #define EPOLL_MAX_EVENTS 4096
+#endif
 
 #define epoll_malloc(sz)  epoll_realloc(NULL, sz)
 #define epoll_free(ptr)   (void)epoll_realloc(ptr, 0)
@@ -94,6 +97,10 @@ HANDLE epoll_create(int size)
 
 HANDLE epoll_create1(int flags)
 {
+  if (flags && flags != EPOLL_CLOEXEC) {
+    errno = EINVAL;
+    return -1;
+  }
   errno = 0;
   int efd = kqueue();
   if (efd == -1)
@@ -208,8 +215,14 @@ int kepoll_del(struct epoll_t *ep, SOCKET fd, bool deleted)
 int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
   errno = 0;
-  if (efd <= 0) {
+
+  if (efd <= 0 || fd <= (SOCKET)~0) {
     errno = EBADF;
+    return EPOLL_INVALID;
+  }
+
+  if (op != EPOLL_CTL_DEL && !event) {
+    errno = EFAULT;
     return EPOLL_INVALID;
   }
 
@@ -234,11 +247,10 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   errno = 0;
 
   if (efd <= 0) {
-    errno = EBADF; // 指针不会为负数.
+    errno = EBADF; // epfd is not a valid file descriptor.
     return EPOLL_INVALID;
   }
-  struct epoll_t *ep = (struct epoll_t *)efd;
-  // efd = ep->efd;
+
   if (!events) {
     errno = EFAULT;
     return EPOLL_INVALID;
@@ -248,7 +260,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     errno = EINVAL;
     return EPOLL_INVALID;
   }
-  if (maxevents > EPOLL_MAX_EVENTS) maxevents = EPOLL_MAX_EVENTS;
+
+  if (maxevents > EPOLL_MAX_EVENTS)
+    maxevents = EPOLL_MAX_EVENTS;
 
   /* 兼容两者的时间行为 */
   struct timespec ts; struct timespec *tsp = NULL;
@@ -259,6 +273,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     // printf("struct timespec = {%ld, %ld}\n", ts.tv_sec, ts.tv_nsec);
   }
 
+  struct epoll_t *ep = (struct epoll_t *)efd;
   struct kevent *kqevents = ep->kqevents;
   struct epoll_event *ev;
   int nevents = kevent(ep->efd, NULL, 0, kqevents, maxevents, tsp);

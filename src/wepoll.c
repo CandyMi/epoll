@@ -546,6 +546,14 @@ int epoll_ctl(HANDLE ephnd, int op, SOCKET sock, struct epoll_event* ev) {
   port_state_t* port_state;
   int r;
 
+  errno = 0;
+
+  if (sock <= (SOCKET)~0)
+    return_set_error(-1, ERROR_INVALID_PARAMETER);
+
+  if (op != EPOLL_CTL_DEL && !ev)
+    return_set_error(-1, ERROR_INVALID_PARAMETER);
+
   if (init() < 0)
     return -1;
 
@@ -580,6 +588,9 @@ int epoll_wait(HANDLE ephnd,
   ts_tree_node_t* tree_node;
   port_state_t* port_state;
   int num_events;
+
+  if (!events)
+    return_set_error(-1, ERROR_INVALID_PARAMETER);
 
   if (maxevents <= 0)
     return_set_error(-1, ERROR_INVALID_PARAMETER);

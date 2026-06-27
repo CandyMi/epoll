@@ -119,7 +119,7 @@ static inline
 struct timeval* uepoll_timeout2timeval(int timeout, struct timeval* tv, int64_t *now)
 {
   if (timeout >= 0) {
-    tv->tv_sec = (timeout - timeout % 1000) / 1000;
+    tv->tv_sec = timeout / 1000;
     tv->tv_usec = (timeout % 1000) * 1000;
     if (now) *now = uepoll_now();
     return tv;
@@ -287,13 +287,19 @@ int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
 int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
   errno = 0;
-  if (efd <= 0) {
-    errno = EBADF; // 指针不会为负数.
+
+  if (efd <= 0 || fd <= (SOCKET)~0) {
+    errno = EBADF;
     return EPOLL_INVALID;
   }
 
   if (fd < 0 || fd >= EPOLL_MAX_EVENTS) {
     errno = ENOSPC; // `fd`必须在0~FD_SETSIZE之间.
+    return EPOLL_INVALID;
+  }
+
+  if (op != EPOLL_CTL_DEL && !event) {
+    errno = EFAULT;
     return EPOLL_INVALID;
   }
 
@@ -329,12 +335,19 @@ int epoll_close(HANDLE efd)
 
 HANDLE epoll_create(int size)
 {
-  (void)size;
+  if (size < 0) {
+    errno = EINVAL;
+    return -1;
+  }
   return epoll_create1(0);
 }
 
 HANDLE epoll_create1(int flags)
 {
+  if (flags && flags != EPOLL_CLOEXEC) {
+    errno = EINVAL;
+    return -1;
+  }
   errno = 0;
   struct epoll_t *ep = (struct epoll_t *)epoll_malloc(sizeof(struct epoll_t));
   if (!ep) {
@@ -370,7 +383,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   errno = 0;
 
   if (efd <= 0) {
-    errno = EBADF; // 指针不会为负数.
+    errno = EBADF; // epfd is not a valid file descriptor.
     return EPOLL_INVALID;
   }
 
@@ -384,80 +397,88 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     return EPOLL_INVALID;
   }
 
-  struct timeval ts = {0, 0}; int64_t wait_time;
-  struct timeval *tp = uepoll_timeout2timeval(timeout, &ts, &wait_time);
-  // printf("struct timeval ts {%zd, %zd}\n", ts.tv_sec, ts.tv_usec);
+  if (maxevents > EPOLL_MAX_EVENTS)
+    maxevents = EPOLL_MAX_EVENTS;
 
+  int r;
   struct epoll_t* ep = (struct epoll_t*)efd;
-  epoll_spinlock_lock(&ep->lock);
-  epoll_receive(ep); /* 每次监听前必须重置状态（多一次系统调用） */
-  fd_set rset, wset, eset; /* 使用复制拷贝来解决多线程竞争的问题 */
-  int nfds = ep->nfds;
-  FD_COPY(&ep->rset, &rset); FD_COPY(&ep->wset, &wset); FD_COPY(&ep->eset, &eset);
-  epoll_spinlock_unlock(&ep->lock);
+  while (1)
+  {
+    struct timeval ts = {0, 0}; int64_t wait_time;
+    struct timeval *tp = uepoll_timeout2timeval(timeout, &ts, &wait_time);
+    // printf("struct timeval ts {%zd, %zd}\n", ts.tv_sec, ts.tv_usec);
 
-  int nevents = 0; struct epoll_event* ev;
-  int r = select(nfds, &rset, &wset, &eset, tp);
-  if (r > 0)
-  { // select 返回的是事件数量, 不是文件描述符的数量.
-    if (FD_ISSET(ep->pipes[0], &rset)) {
-      /**
-       * 这里需要处理以下情况：
-       * 1. 其它线程可能修改了`3`个集合内的`fd`，因此需要重新监听已注册的`fd`.
-       * 2. 如果`timeout > 0`则必须计算`select`调用过去了多久时间.
-       */
-      if (timeout > 0) {
-        wait_time = uepoll_now() - wait_time;
-        timeout = wait_time >= timeout ? 0 : timeout - wait_time;
-      }
-      return epoll_wait(efd, events, maxevents, timeout);
-    }
-    // printf("r = %d, nfds = %d\n", r, nfds);
-    /* 检查`fd`是否被设置 */
     epoll_spinlock_lock(&ep->lock);
-    for (SOCKET fd = 0; fd < nfds; fd++)
-    {
-      if (uepoll_has_fd(ep, fd))
-      {
-        ev = &events[nevents];
-        ev->events = EPOLLEMPTY;
-
-        if (FD_ISSET(fd, &rset)) {
-          ev->events |= EPOLLIN; r--;
-        }
-
-        if (FD_ISSET(fd, &wset)) {
-          ev->events |= EPOLLOUT; r--;
-        }
-
-        if (FD_ISSET(fd, &eset)) {
-          ev->events |= EPOLLERR; r--;
-        }
-
-        if (ev->events) {
-          ev->data.ptr = ep->udata[fd].data.ptr;
-          /* 如果携带`EPOLLONESHOT`属性, 则每次都需要重新修改事件 */
-          if (uepoll_has_oneshot(ep->udata[fd].events)) {
-            FD_CLR(fd, &ep->rset);
-            FD_CLR(fd, &ep->wset);
-            FD_CLR(fd, &ep->eset);
-            ep->udata[fd]._nouse = 0;
-            ep->udata[fd].events = EPOLLEMPTY;
-            ep->udata[fd].data.ptr = NULL;
-          }
-          nevents = nevents + 1;
-          /* 最多只能返回`maxevents`个事件. */
-          if (nevents == maxevents)
-            break;
-          /* 所有事件已经处理完毕. */
-          if (r <= 0)
-            break;
-        }
-
-      }
-    }
+    epoll_receive(ep); /* 每次监听前必须重置状态（多一次系统调用） */
+    fd_set rset, wset, eset; /* 使用复制拷贝来解决多线程竞争的问题 */
+    int nfds = ep->nfds;
+    FD_COPY(&ep->rset, &rset); FD_COPY(&ep->wset, &wset); FD_COPY(&ep->eset, &eset);
     epoll_spinlock_unlock(&ep->lock);
-    r = nevents;
+
+    int nevents = 0; struct epoll_event* ev;
+    r = select(nfds, &rset, &wset, &eset, tp);
+    if (r > 0)
+    { // select 返回的是事件数量, 不是文件描述符的数量.
+      if (FD_ISSET(ep->pipes[0], &rset)) {
+        /**
+         * 这里需要处理以下情况：
+         * 1. 其它线程可能修改了`3`个集合内的`fd`，因此需要重新监听已注册的`fd`.
+         * 2. 如果`timeout > 0`则必须计算`select`调用过去了多久时间.
+         */
+        if (timeout > 0) {
+          timeout -= (uepoll_now() - wait_time);
+          if (timeout < 0) timeout = 0;
+        }
+        continue;
+      }
+      // printf("r = %d, nfds = %d\n", r, nfds);
+      /* 检查`fd`是否被设置 */
+      epoll_spinlock_lock(&ep->lock);
+      for (SOCKET fd = 0; fd < nfds; fd++)
+      {
+        if (uepoll_has_fd(ep, fd))
+        {
+          ev = &events[nevents];
+          ev->events = EPOLLEMPTY;
+
+          if (FD_ISSET(fd, &rset)) {
+            ev->events |= EPOLLIN; r--;
+          }
+
+          if (FD_ISSET(fd, &wset)) {
+            ev->events |= EPOLLOUT; r--;
+          }
+
+          if (FD_ISSET(fd, &eset)) {
+            ev->events |= EPOLLERR; r--;
+          }
+
+          if (ev->events) {
+            ev->data.ptr = ep->udata[fd].data.ptr;
+            /* 如果携带`EPOLLONESHOT`属性, 则每次都需要重新修改事件 */
+            if (uepoll_has_oneshot(ep->udata[fd].events)) {
+              FD_CLR(fd, &ep->rset);
+              FD_CLR(fd, &ep->wset);
+              FD_CLR(fd, &ep->eset);
+              ep->udata[fd]._nouse = 0;
+              ep->udata[fd].events = EPOLLEMPTY;
+              ep->udata[fd].data.ptr = NULL;
+            }
+            nevents = nevents + 1;
+            /* 最多只能返回`maxevents`个事件. */
+            if (nevents == maxevents)
+              break;
+            /* 所有事件已经处理完毕. */
+            if (r <= 0)
+              break;
+          }
+
+        }
+      }
+      epoll_spinlock_unlock(&ep->lock);
+      r = nevents;
+    }
+    break;
   }
   // Done.
   return r;
