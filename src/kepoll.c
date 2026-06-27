@@ -329,11 +329,13 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
           ev->events |= EPOLLOUT;
           break;
         }
+#if defined (EVFILT_EXCEPT)        
         case EVFILT_EXCEPT:
         {
           ev->events |= EPOLLPRI;
           break;
         }
+#endif
       }
 
     }
