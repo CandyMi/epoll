@@ -37,7 +37,7 @@
 
 # Limit
 
-  * `EPOLLET` is never supported.
+  * `EPOLLET` is supported on kqueue backend (macOS/BSD), not on select backend.
   * `wepoll` just supported `SOCKET`/`Pipe`.
   * `FD_SETSIZE` was limit the maximum number of fd.
 

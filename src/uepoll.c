@@ -4,11 +4,14 @@
 
 #include "uepoll.h"
 
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
 #include <errno.h>
 #include <unistd.h>
 #include <fcntl.h>
 
-#include <stdbool.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/select.h>

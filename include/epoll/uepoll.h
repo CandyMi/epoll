@@ -18,9 +18,7 @@
 #endif
 
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdbool.h>
+#include <stddef.h>
 
 typedef intptr_t HANDLE;
 typedef int SOCKET;

@@ -282,8 +282,8 @@ User-data union carried with each registered fd. The value set in `epoll_ctl` is
 
 ```c
 typedef struct epoll_event {
-    int32_t      _nouse;  /* internal — do not touch */
     uint32_t     events;  /* bitmask of EPOLL_* flags */
+    int32_t      _nouse;  /* internal — do not touch */
     epoll_data_t data;    /* user data */
 } epoll_event;
 ```
