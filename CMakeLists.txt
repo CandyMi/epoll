@@ -6,84 +6,83 @@ message("Author  Github : github.com/CandyMi")
 message("======================================")
 
 cmake_minimum_required(VERSION 3.10)
-
 project("epoll")
 
-# ── AddressSanitizer (GCC/Clang only; MSVC uses /fsanitize=address) ──
+# ── AddressSanitizer ─────────────────────────
 option(ENABLE_ASAN "Enable AddressSanitizer for debugging" OFF)
 if(ENABLE_ASAN)
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options(-fsanitize=address -g -O1 -fno-omit-frame-pointer)
     add_link_options(-fsanitize=address)
-    message(STATUS "AddressSanitizer enabled")
   elseif(MSVC)
-    message(STATUS "MSVC: use /fsanitize=address in CMAKE_C_FLAGS manually")
+    message(STATUS "MSVC ASAN: set /fsanitize=address in CMAKE_C_FLAGS manually")
   endif()
 endif()
 
-# C standard not forced — modern compilers default to C11/C17.
-# Minimum C99 (for-loop decl, stdbool.h, // comments).
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
 
-# ── Include path ──────────────────────────────
-# Public so consumers (and test) get the header search path
-add_library(epoll INTERFACE)
-target_include_directories(epoll INTERFACE
+# ── Backend selection ────────────────────────
+if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+  set(epoll_src src/wepoll.c)
+elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
+  set(epoll_src src/epoll.c)
+elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|Darwin")
+  set(epoll_src src/kepoll.c)
+else()
+  set(epoll_src src/uepoll.c)
+endif()
+
+# ── Object library — compile once ────────────
+# When linked into a SHARED target CMake adds -fPIC automatically.
+add_library(epoll_obj OBJECT ${epoll_src})
+target_include_directories(epoll_obj PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/epoll>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/epoll>)
 
-# ── Backend selection ──────────────────────────
-add_executable(main test/main.c)
-if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-  file(GLOB epoll_src src/wepoll.c)
-elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
-  file(GLOB epoll_src src/epoll.c)
-elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|Darwin")
-  file(GLOB epoll_src src/kepoll.c)
-else()
-  file(GLOB epoll_src src/uepoll.c)
+find_file(_have_atomic NAMES stdatomic.h)
+if(_have_atomic)
+  target_compile_definitions(epoll_obj PUBLIC EPOLL_USE_ATOMIC=1)
 endif()
 
-if(NOT WIN32)
-  add_library(epoll_dynamic SHARED ${epoll_src})
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
-  target_link_libraries(epoll_dynamic PRIVATE epoll)
-endif()
-
-add_library(epoll_static STATIC ${epoll_src})
-
+# ── Static library (all platforms) ───────────
+add_library(epoll_static STATIC $<TARGET_OBJECTS:epoll_obj>)
+target_link_libraries(epoll_static PUBLIC epoll_obj)
 if(WIN32)
   set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
-  target_link_libraries(epoll_static PUBLIC ws2_32)
 else()
   set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
 endif()
 
-target_link_libraries(epoll_static PUBLIC epoll)
+# ── Shared library (not on Windows; static-only avoids .lib collision) ──
+if(NOT WIN32)
+  add_library(epoll_dynamic SHARED $<TARGET_OBJECTS:epoll_obj>)
+  target_link_libraries(epoll_dynamic PUBLIC epoll_obj)
+endif()
+
+# ── Platform link deps ───────────────────────
+if(WIN32)
+  target_link_libraries(epoll_static PUBLIC ws2_32)
+endif()
+
+# ── Test ─────────────────────────────────────
+add_executable(main test/main.c)
 target_link_libraries(main PRIVATE epoll_static)
 
-find_file(EPOLL_ATOMIC NAMES stdatomic.h)
-if (EPOLL_ATOMIC)
-  if(NOT WIN32)
-    target_compile_definitions(epoll_dynamic PRIVATE EPOLL_USE_ATOMIC=1)
-  endif()
-  target_compile_definitions(epoll_static PRIVATE EPOLL_USE_ATOMIC=1)
-endif()
-
-# ── Install rules ─────────────────────────────
+# ── Install ──────────────────────────────────
 include(GNUInstallDirs)
 
+set(epoll_targets epoll_static)
 if(NOT WIN32)
-  install(TARGETS epoll_static epoll_dynamic epoll
-          EXPORT epoll-targets
-          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-else()
-  install(TARGETS epoll_static epoll
-          EXPORT epoll-targets
-          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+  list(APPEND epoll_targets epoll_dynamic)
 endif()
 
-install(FILES include/epoll/epoll.h include/epoll/uepoll.h include/epoll/wepoll.h
+install(TARGETS ${epoll_targets}
+        EXPORT epoll-targets
+        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+install(FILES include/epoll/epoll.h
+              include/epoll/uepoll.h
+              include/epoll/wepoll.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/epoll)
