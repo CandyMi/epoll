@@ -44,37 +44,46 @@ else()
   file(GLOB epoll_src src/uepoll.c)
 endif()
 
-add_library(epoll_dynamic SHARED ${epoll_src})
+if(NOT WIN32)
+  add_library(epoll_dynamic SHARED ${epoll_src})
+  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
+  target_link_libraries(epoll_dynamic PRIVATE epoll)
+endif()
+
 add_library(epoll_static STATIC ${epoll_src})
 
-if(CMAKE_SYSTEM_NAME MATCHES "Windows")
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
+if(WIN32)
   set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "")
-  target_link_libraries(epoll_dynamic PRIVATE ws2_32)
   target_link_libraries(epoll_static PUBLIC ws2_32)
 else()
-  set_target_properties(epoll_dynamic PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
   set_target_properties(epoll_static PROPERTIES OUTPUT_NAME "epoll" PREFIX "lib")
 endif()
 
-target_link_libraries(epoll_dynamic PRIVATE epoll)
 target_link_libraries(epoll_static PUBLIC epoll)
 target_link_libraries(main PRIVATE epoll_static)
 
 find_file(EPOLL_ATOMIC NAMES stdatomic.h)
 if (EPOLL_ATOMIC)
-  target_compile_definitions(epoll_dynamic PRIVATE EPOLL_USE_ATOMIC=1)
+  if(NOT WIN32)
+    target_compile_definitions(epoll_dynamic PRIVATE EPOLL_USE_ATOMIC=1)
+  endif()
   target_compile_definitions(epoll_static PRIVATE EPOLL_USE_ATOMIC=1)
 endif()
 
 # ── Install rules ─────────────────────────────
 include(GNUInstallDirs)
 
-install(TARGETS epoll_static epoll_dynamic epoll
-        EXPORT epoll-targets
-        ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(NOT WIN32)
+  install(TARGETS epoll_static epoll_dynamic epoll
+          EXPORT epoll-targets
+          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
+          LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+          RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+else()
+  install(TARGETS epoll_static epoll
+          EXPORT epoll-targets
+          ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
 
 install(FILES include/epoll/epoll.h include/epoll/uepoll.h include/epoll/wepoll.h
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/epoll)
