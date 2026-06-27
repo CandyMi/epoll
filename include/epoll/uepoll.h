@@ -77,8 +77,8 @@ typedef union epoll_data_t {
 } epoll_data_t;
 
 typedef struct epoll_event {
-  int32_t      _nouse; // internal use only
   uint32_t     events;
+  int32_t      _nouse; // internal use only
   epoll_data_t data;
 } epoll_event;
 
