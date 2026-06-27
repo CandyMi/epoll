@@ -3,9 +3,9 @@
 # epoll
 
 [![CI](https://github.com/CandyMi/epoll/workflows/CI/badge.svg)](https://github.com/CandyMi/epoll/actions)
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
-[![C](https://img.shields.io/badge/C-C99%20%2F%20C11-555555?logo=c)](https://en.cppreference.com/w/c)
-[![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS%20|%20BSD%20|%20POSIX-lightgrey)](AGENTS.md)
+[![License](https://img.shields.io/badge/license-MIT-informational)](LICENSE)
+[![C](https://img.shields.io/badge/C-C99%20%2F%20C11-blue?logo=c)](https://en.cppreference.com/w/c)
+[![Platform](https://img.shields.io/badge/platform-Windows%20|%20Linux%20|%20macOS%20|%20BSD%20|%20POSIX-blue)](AGENTS.md)
 
   A project that uses `iocp` and `select` to simulate the ABI of `epoll`.
 
