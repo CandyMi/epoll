@@ -489,7 +489,9 @@ int main(int argc, char const *argv[])
     testcase_epoll_watch();
     testcase_epoll_repeat();
     testcase_epoll_oneshot();
-    // testcase_epoll_et_mode();  /* commented out — select backend doesn't support EPOLLET */
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__)
+    testcase_epoll_et_mode();  /* kqueue (BSD/Darwin) supports ET via EV_CLEAR */
+#endif
     testcase_epoll_ctl_del();
     testcase_epoll_ctl_mod();
     testcase_epoll_out();

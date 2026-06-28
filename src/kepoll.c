@@ -293,74 +293,50 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
      * 1. 合并相同`fd`的事件.
      * 2. 实现单`fd`的`ONESHOT`删除.
      */
-    uintptr_t before_fd = (uintptr_t)-1; int pos = 0; int nkqevents = 0;
+    uintptr_t before_fd = (uintptr_t)-1; int nkqevents = 0;
     for (int i = 0; i < nevents; i++)
     {
+      /* 标记上事件的fd, 方便融合事件. 相同fd的事件总是在旁边 */
+      if (before_fd != kqevents[i].ident) {
+        before_fd = kqevents[i].ident;
+        ev = &events[nkqevents];
+        ev->events = EPOLLEMPTY;
+        ev->data.ptr = kqevents[i].udata;
+        nkqevents++;
+      } else {
+        ev = &events[nkqevents - 1];
+      }
+
       uint16_t flags = kqevents[i].flags;
       if (flags & EV_ONESHOT) {
         /* ONESHOT 事件先输出到 events[]，再清理内部状态 */
-        ev = &events[i];
-        ev->events = 0;
         if (flags & EV_ERROR) ev->events |= EPOLLERR;
         if (flags & EV_EOF)   ev->events |= EPOLLHUP;
         if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
         if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
         ev->data.ptr = kqevents[i].udata;
-        nkqevents++;
         kepoll_del(ep, kqevents[i].ident, false);
         continue;
       } else if (flags & EV_ERROR || flags & EV_EOF) {
         // printf("EV_ERROR | EV_EOF %ld, 0x%08x\n", kqevents[i].ident, flags);
         kepoll_del(ep, kqevents[i].ident, false);
-        ev = &events[i];
-        /* EV_EOF = peer clean close → EPOLLHUP
-         * EV_ERROR = kevent system error → EPOLLERR
-         * both = abnormal disconnect → EPOLLHUP | EPOLLERR */
-        ev->events = 0;
         if (flags & EV_ERROR) ev->events |= EPOLLERR;
         if (flags & EV_EOF)   ev->events |= EPOLLHUP;
         if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
         if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
         ev->data.ptr = kqevents[i].udata;
-        nkqevents++;
         continue;
-      }
-      // printf("kqevents[%d] = {.fd = %ld, .filter = %d, .flags = 0x%08x, .fflags = 0x%08x}\n", i, kqevents[i].ident, kqevents[i].filter, kqevents[i].flags, kqevents[i].fflags);
-      /* 试图合并事件... */
-      bool eqfd = before_fd == kqevents[i].ident;
-      if (!eqfd) {
-        /* 标记上事件的fd, 方便融合事件. 相同fd的事件总是在旁边 */
-        before_fd = kqevents[i].ident;
-        ev = &events[i];
-        ev->events = EPOLLEMPTY;
-        ev->data.ptr = kqevents[i].udata;
-        nkqevents++; pos = i;
-      } else {
-        ev = &events[pos];
       }
 
       /* 判断 kqueue 事件 */
       switch (kqevents[i].filter)
       {
-        case EVFILT_READ:
-        {
-          ev->events |= EPOLLIN;
-          break;
-        }
-        case EVFILT_WRITE:
-        {
-          ev->events |= EPOLLOUT;
-          break;
-        }
-#if defined (EVFILT_EXCEPT)        
-        case EVFILT_EXCEPT:
-        {
-          ev->events |= EPOLLPRI;
-          break;
-        }
+        case EVFILT_READ:   ev->events |= EPOLLIN; break;
+        case EVFILT_WRITE:  ev->events |= EPOLLOUT; break;
+#if defined (EVFILT_EXCEPT)
+        case EVFILT_EXCEPT: ev->events |= EPOLLPRI; break;
 #endif
       }
-
     }
     nevents = nkqevents;
   }

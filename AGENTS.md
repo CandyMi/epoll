@@ -83,7 +83,7 @@ epoll/
 - **ONESHOT handling** ([`kepoll.c:259-275`](kepoll.c:259)): After returning from `epoll_wait`, `EV_ONESHOT` events are first written to the user `events[]` buffer, then `kepoll_del(ep, fd, false)` is called (DISABLE only, not DELETE).
 - **NULL event validation** ([`kepoll.c:124-126`](kepoll.c:124)): `_kepoll_register` checks for NULL `event` and returns `EFAULT` before taking the spinlock.
 - **Thread safety** ([`kepoll.c:17-42`](kepoll.c:17)): 3-level degrading spinlock (C11 `atomic_flag` → GCC `__sync_*` → `#error`). No pthread fallback.
-- **Hardcoded maxevents**: [`kepoll.c:44`](kepoll.c:44) `#define EPOLL_MAX_EVENTS 1024`.
+- **Hardcoded maxevents**: [`kepoll.c:44`](kepoll.c:44) `#define EPOLL_MAX_EVENTS 4096`.
 
 ### uepoll.c — select Backend
 
