@@ -535,7 +535,16 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
     struct epoll_t *ep = (struct epoll_t *)efd;
 
-    /* poll(2) uses milliseconds directly — no timeval conversion needed. */
+    /* poll(2) uses milliseconds directly — no timeval conversion needed.
+     *
+     * Working buffer is declared once outside the loop and reused across
+     * retries (pipe wake / EINTR).  It starts on the stack (≤ 256 fds)
+     * and transparently upgrades to the heap via (re)alloc on demand —
+     * no repeated alloc/free in the retry path. */
+    struct pollfd  wstack[WO_STACK_NFDS];
+    struct pollfd *working  = wstack;
+    bool           heap     = false;
+    size_t         wcap     = WO_STACK_NFDS;
 
     while (1)
     {
@@ -544,35 +553,38 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         ppoll_drain_pipe(ep);
         int nfds = ep->nfds;
 
-        /* Allocate per-call working buffer (stack for small, heap for large) */
-        struct pollfd wstack[WO_STACK_NFDS];
-        struct pollfd *working = wstack;
-        bool heap_alloced = false;
-        if (nfds > WO_STACK_NFDS) {
-            working = (struct pollfd *)epoll_malloc((size_t)nfds * sizeof(struct pollfd));
+        /* Grow working buffer on demand — only when nfds exceeds current
+         * capacity.  Never shrinks, so retry loops pay zero alloc cost. */
+        if ((size_t)nfds > wcap) {
+            size_t new_sz = (size_t)nfds * sizeof(struct pollfd);
+            if (!heap) {
+                working = (struct pollfd *)epoll_malloc(new_sz);
+                heap = true;
+            } else {
+                working = (struct pollfd *)epoll_realloc(working, new_sz);
+            }
             if (!working) {
                 epoll_spinlock_unlock(&ep->lock);
                 errno = ENOMEM;
-                return EPOLL_INVALID;
+                goto out;
             }
-            heap_alloced = true;
+            wcap = (size_t)nfds;
         }
+
         memcpy(working, ep->pollfds, (size_t)nfds * sizeof(struct pollfd));
         epoll_spinlock_unlock(&ep->lock);
 
         /* ── Step 2: call poll(2) ── */
         int r = poll(working, (nfds_t)nfds, timeout);
         if (r < 0) {
-            if (heap_alloced) epoll_free(working);
             /* EINTR is the only recoverable error — retry. */
             if (errno == EINTR)
                 continue;
-            return EPOLL_INVALID;
+            goto out;
         }
 
         if (r == 0) {
             /* Timeout with no events */
-            if (heap_alloced) epoll_free(working);
             return 0;
         }
 
@@ -582,7 +594,6 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
              * We do not recalculate remaining timeout here (conservative:
              * may wait slightly longer than requested).  The select backend
              * has the same limitation when CLOCK_MONOTONIC_COARSE is absent. */
-            if (heap_alloced) epoll_free(working);
             continue;
         }
 
@@ -626,7 +637,11 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         }
         epoll_spinlock_unlock(&ep->lock);
 
-        if (heap_alloced) epoll_free(working);
+        if (heap) epoll_free(working);
         return nevents;
     }
+
+out:
+    if (heap) epoll_free(working);
+    return EPOLL_INVALID;
 }
