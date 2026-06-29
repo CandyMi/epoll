@@ -413,16 +413,19 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 
 ## Platform-Specific Limitations
 
-| Feature | Linux | macOS/BSD (kqueue) | Windows (wepoll) | Other POSIX (select) |
-|---|---|---|---|---|
-| Max fds | Kernel limit | 1024 (`EPOLL_MAX_EVENTS`) | System limit | 1024 (`FD_SETSIZE`) |
-| `EPOLLET` | ✅ | ✅ (→ `EV_CLEAR`) | ❌ | ❌ |
-| `EPOLLHUP` | ✅ | ✅ (EV_EOF → `EPOLLHUP`) | ❌ | ❌ |
-| `EPOLLRDHUP` | ✅ | ❌ | ❌ | ❌ |
-| `EPOLLPRI` | ✅ | ✅ macOS only (EVFILT_EXCEPT) | ❌ | ❌ |
-| `EPOLLONESHOT` | ✅ | ✅ (→ `EV_ONESHOT`) | ✅ | ✅ |
-| Non-socket fds | ✅ | ✅ | ❌ (sockets/pipes only) | ✅ |
-| `epoll_event._nouse` | N/A | N/A | ❌ (no such field) | ✅ (internal) |
+| Feature | Linux | macOS/BSD (kqueue) | Windows (wepoll) | Other POSIX (select) | Other POSIX (poll/ppoll) |
+|---|---|---|---|---|---|
+| Max fds | Kernel limit | 1024 (`EPOLL_MAX_EVENTS`) | System limit | 1024 (`FD_SETSIZE`) | **unlimited** (RLIMIT_NOFILE) |
+| `EPOLLET` | ✅ | ✅ (→ `EV_CLEAR`) | ❌ | ❌ | ❌ |
+| `EPOLLHUP` | ✅ | ✅ (EV_EOF → `EPOLLHUP`) | ❌ | ❌ | ✅ (via POLLHUP) |
+| `EPOLLRDHUP` | ✅ | ❌ | ❌ | ❌ | ❌ |
+| `EPOLLPRI` | ✅ | ✅ macOS only (EVFILT_EXCEPT) | ❌ | ❌ | ✅ (via POLLPRI) |
+| `EPOLLONESHOT` | ✅ | ✅ (→ `EV_ONESHOT`) | ✅ | ✅ | ✅ |
+| Non-socket fds | ✅ | ✅ | ❌ (sockets/pipes only) | ✅ | ✅ |
+| `epoll_event._nouse` | N/A | N/A | ❌ (no such field) | ✅ (internal) | ✅ (internal) |
+| Thread safety | kernel | spinlock | kernel + lock | spinlock | spinlock |
+| Timeout precision | ms | ms (timespec) | ms | ms (timeval) | **ms directly** (poll) |
+| Self-waking | kernel | N/A | N/A | pipe | pipe |
 
 ---
 
@@ -445,8 +448,15 @@ gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/uepoll.c test/main.c -o main
 # macOS/BSD (kqueue)
 gcc -I include/epoll src/kepoll.c test/main.c -o main
 
-# POSIX fallback (select)
+# POSIX fallback (select) — limited to FD_SETSIZE
 gcc -I include/epoll src/uepoll.c test/main.c -o main
+
+# POSIX fallback (poll) — unlimited fds, no FD_SETSIZE limit
+gcc -I include/epoll src/ppoll.c test/main.c -o main
+
+# macOS/BSD (force poll instead of kqueue via cmake)
+cmake -S . -B build -DEPFD_POLL=ON
+cmake --build build
 
 # Windows (IOCP, MSVC)
 cl /I include/epoll src/wepoll.c test/main.c

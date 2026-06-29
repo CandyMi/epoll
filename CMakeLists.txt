@@ -22,14 +22,33 @@ endif()
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
 
 # ── Backend selection ────────────────────────
+# ppoll.c (poll(2)) is the default POSIX fallback.  Unlike select:
+#   • No FD_SETSIZE limit — supports up to RLIMIT_NOFILE.
+#   • Milliseconds direct — no timeval conversion.
+#   • Reports EPOLLHUP / EPOLLPRI natively.
+#
+# Options:
+#   -DEPFD_SELECT=ON   → force uepoll.c (select) on non-Linux/BSD systems
+#   -DEPFD_POLL=ON     → force ppoll.c on BSD/Darwin (override kqueue)
+option(EPFD_SELECT "Use uepoll.c (select backend) instead of ppoll.c (poll)" OFF)
+option(EPFD_POLL    "Use ppoll.c (poll backend) instead of kepoll.c (kqueue) on BSD/Darwin" ON)
+
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
   set(epoll_src src/wepoll.c)
 elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
   set(epoll_src src/epoll.c)
 elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|Darwin")
-  set(epoll_src src/kepoll.c)
+  if(EPFD_POLL)
+    set(epoll_src src/ppoll.c)
+  else()
+    set(epoll_src src/kepoll.c)
+  endif()
 else()
-  set(epoll_src src/uepoll.c)
+  if(EPFD_SELECT)
+    set(epoll_src src/uepoll.c)
+  else()
+    set(epoll_src src/ppoll.c)
+  endif()
 endif()
 
 # ── Object library — compile once ────────────
@@ -67,6 +86,11 @@ endif()
 # ── Test ─────────────────────────────────────
 add_executable(main test/main.c)
 target_link_libraries(main PRIVATE epoll_static)
+
+# ── Backend identification for test suite ────
+if(epoll_src STREQUAL "src/ppoll.c")
+  target_compile_definitions(main PRIVATE EPOLL_BACKEND_POLL=1)
+endif()
 
 # ── Install ──────────────────────────────────
 include(GNUInstallDirs)
