@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 
 /* ── Spinlock (3-level degrading, same as uepoll.c / kepoll.c) ────── */
 
@@ -109,6 +110,26 @@
     )
 
 #define PP_HAS_ONESHOT(ev)  ((ev) & EPOLLONESHOT)
+
+/* ── Monotonic clock (ms) ──────────────────────────────────────────── */
+/* Same 3-level degrade as uepoll.c.  Used to compute remaining timeout
+ * after a pipe-wake / EINTR retry. */
+static inline int64_t ppoll_now_ms(void)
+{
+#if defined(CLOCK_MONOTONIC_COARSE)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#elif defined(CLOCK_MONOTONIC)
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#endif
+}
 
 /* ── Helpers ───────────────────────────────────────────────────────── */
 
@@ -545,6 +566,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     struct pollfd *working  = wstack;
     bool           heap     = false;
     size_t         wcap     = WO_STACK_NFDS;
+    int64_t        poll_start = 0;
 
     while (1)
     {
@@ -574,12 +596,23 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         memcpy(working, ep->pollfds, (size_t)nfds * sizeof(struct pollfd));
         epoll_spinlock_unlock(&ep->lock);
 
-        /* ── Step 2: call poll(2) ── */
+        /* ── Step 2: record start and call poll(2) ── */
+        if (timeout > 0)
+            poll_start = ppoll_now_ms();
+
         int r = poll(working, (nfds_t)nfds, timeout);
         if (r < 0) {
-            /* EINTR is the only recoverable error — retry. */
-            if (errno == EINTR)
+            /* EINTR is the only recoverable error — retry with decay. */
+            if (errno == EINTR) {
+                if (timeout > 0) {
+                    int64_t elapsed = ppoll_now_ms() - poll_start;
+                    if (elapsed > 0) {
+                        timeout -= (int)elapsed;
+                        if (timeout < 0) timeout = 0;
+                    }
+                }
                 continue;
+            }
             goto out;
         }
 
@@ -591,9 +624,14 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         /* ── Step 3: check for pipe wake ── */
         if (working[0].revents & POLLIN) {
             /* Another thread modified the set — drain and restart.
-             * We do not recalculate remaining timeout here (conservative:
-             * may wait slightly longer than requested).  The select backend
-             * has the same limitation when CLOCK_MONOTONIC_COARSE is absent. */
+             * Decay remaining timeout if applicable. */
+            if (timeout > 0) {
+                int64_t elapsed = ppoll_now_ms() - poll_start;
+                if (elapsed > 0) {
+                    timeout -= (int)elapsed;
+                    if (timeout < 0) timeout = 0;
+                }
+            }
             continue;
         }
 
