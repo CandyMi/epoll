@@ -490,7 +490,7 @@ int main(int argc, char const *argv[])
     testcase_epoll_repeat();
     testcase_epoll_oneshot();
 #if !defined(EPOLL_BACKEND_POLL) && (defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__))
-    testcase_epoll_et_mode();  /* kqueue (BSD/Darwin) supports ET via EV_CLEAR; ppoll is always LT */
+    testcase_epoll_et_mode();  /* kqueue (BSD/Darwin) supports ET via EV_CLEAR; pepoll is always LT */
 #endif
     testcase_epoll_ctl_del();
     testcase_epoll_ctl_mod();

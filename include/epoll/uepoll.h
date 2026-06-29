@@ -1,6 +1,17 @@
 /*
 **  LICENSE: MIT
 **  Author: CandyMi[https://github.com/candymi]
+**
+**  uepoll.h — Universal type definitions for non-Linux epoll backends.
+**
+**  Shared by kepoll.c, pepoll.c, and uepoll.c.  Defines:
+**    • HANDLE / SOCKET / epoll_data_t / epoll_event
+**    • EPOLL_* event flag constants
+**    • EPOLL_CTL_* operation codes
+**    • The 6-function public API (epoll_create / epoll_create1 /
+**      epoll_close / epoll_ctl / epoll_wait / epoll_allocator)
+**
+**  On Linux (without -DNO_NATIVE_EPOLL=1) <sys/epoll.h> is used instead.
 */
 #ifndef __UEPOLL_H__
 #define __UEPOLL_H__

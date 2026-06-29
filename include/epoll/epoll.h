@@ -1,3 +1,20 @@
+/*
+**  LICENSE: MIT
+**  Author: CandyMi[https://github.com/candymi]
+**
+**  epoll.h — Cross-platform dispatch header.
+**
+**  Single include point for the epoll-compatible API.
+**  Selects the right backend at compile time:
+**
+**    • __linux__ / __ANDROID__  →  native <sys/epoll.h>
+**                                  (or uepoll.h with -DNO_NATIVE_EPOLL=1)
+**    • WIN32                    →  wepoll.h (IOCP)
+**    • otherwise                →  uepoll.h (generic types)
+**
+**  The actual implementation (epoll.c / kepoll.c / pepoll.c / uepoll.c /
+**  wepoll.c) is chosen by the build system.
+*/
 #ifndef EPOLL_H
 #define EPOLL_H
 

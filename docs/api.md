@@ -413,7 +413,7 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 
 ## Platform-Specific Limitations
 
-| Feature | Linux | macOS/BSD (kqueue) | Windows (wepoll) | Other POSIX (select) | Other POSIX (poll/ppoll) |
+| Feature | Linux | macOS/BSD (kqueue) | Windows (wepoll) | Other POSIX (select) | Other POSIX (poll/pepoll) |
 |---|---|---|---|---|---|
 | Max fds | Kernel limit | 1024 (`EPOLL_MAX_EVENTS`) | System limit | 1024 (`FD_SETSIZE`) | **unlimited** (RLIMIT_NOFILE) |
 | `EPOLLET` | ✅ | ✅ (→ `EV_CLEAR`) | ❌ | ❌ | ❌ |
@@ -452,7 +452,7 @@ gcc -I include/epoll src/kepoll.c test/main.c -o main
 gcc -I include/epoll src/uepoll.c test/main.c -o main
 
 # POSIX fallback (poll) — unlimited fds, no FD_SETSIZE limit
-gcc -I include/epoll src/ppoll.c test/main.c -o main
+gcc -I include/epoll src/pepoll.c test/main.c -o main
 
 # macOS/BSD (force poll instead of kqueue via cmake)
 cmake -S . -B build -DEPFD_POLL=ON

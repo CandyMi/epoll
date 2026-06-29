@@ -2,7 +2,7 @@
 **  LICENSE: MIT
 **  Author: CandyMi[https://github.com/candymi]
 **
-**  ppoll.c — poll(2)-based epoll emulation for generic POSIX systems.
+**  pepoll.c — poll(2)-based epoll emulation for generic POSIX systems.
 **
 **  Unlike select (uepoll.c), poll(2):
 **    • Has no FD_SETSIZE limit — supports up to RLIMIT_NOFILE fds.

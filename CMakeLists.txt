@@ -22,16 +22,16 @@ endif()
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
 
 # ── Backend selection ────────────────────────
-# ppoll.c (poll(2)) is the default POSIX fallback.  Unlike select:
+# pepoll.c (poll(2)) is the default POSIX fallback.  Unlike select:
 #   • No FD_SETSIZE limit — supports up to RLIMIT_NOFILE.
 #   • Milliseconds direct — no timeval conversion.
 #   • Reports EPOLLHUP / EPOLLPRI natively.
 #
 # Options:
 #   -DEPFD_SELECT=ON   → force uepoll.c (select) on non-Linux/BSD systems
-#   -DEPFD_POLL=ON     → force ppoll.c on BSD/Darwin (override kqueue)
-option(EPFD_SELECT "Use uepoll.c (select backend) instead of ppoll.c (poll)" OFF)
-option(EPFD_POLL    "Use ppoll.c (poll backend) instead of kepoll.c (kqueue) on BSD/Darwin" ON)
+#   -DEPFD_POLL=ON     → force pepoll.c on BSD/Darwin (override kqueue)
+option(EPFD_SELECT "Use uepoll.c (select backend) instead of pepoll.c (poll)" OFF)
+option(EPFD_POLL    "Use pepoll.c (poll backend) instead of kepoll.c (kqueue) on BSD/Darwin" ON)
 
 if(CMAKE_SYSTEM_NAME MATCHES "Windows")
   set(epoll_src src/wepoll.c)
@@ -39,7 +39,7 @@ elseif(CMAKE_SYSTEM_NAME MATCHES "Linux|Android")
   set(epoll_src src/epoll.c)
 elseif(CMAKE_SYSTEM_NAME MATCHES "BSD|Darwin")
   if(EPFD_POLL)
-    set(epoll_src src/ppoll.c)
+    set(epoll_src src/pepoll.c)
   else()
     set(epoll_src src/kepoll.c)
   endif()
@@ -47,7 +47,7 @@ else()
   if(EPFD_SELECT)
     set(epoll_src src/uepoll.c)
   else()
-    set(epoll_src src/ppoll.c)
+    set(epoll_src src/pepoll.c)
   endif()
 endif()
 
@@ -88,7 +88,7 @@ add_executable(main test/main.c)
 target_link_libraries(main PRIVATE epoll_static)
 
 # ── Backend identification for test suite ────
-if(epoll_src STREQUAL "src/ppoll.c")
+if(epoll_src STREQUAL "src/pepoll.c")
   target_compile_definitions(main PRIVATE EPOLL_BACKEND_POLL=1)
 endif()
 
@@ -106,6 +106,8 @@ install(TARGETS ${epoll_targets}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 
+# All public headers in epoll/ subdirectory.
+# Users: #include "epoll.h"  with  -I${PREFIX}/include/epoll
 install(FILES include/epoll/epoll.h
               include/epoll/uepoll.h
               include/epoll/wepoll.h
