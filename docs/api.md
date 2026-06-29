@@ -148,10 +148,19 @@ Close an epoll instance and release all resources.
 | `EBADF` | Invalid handle (`efd ≤ 0`) |
 | (system) | Underlying `close()` failure |
 
+**Concurrency safety (since v2.0):**
+`epoll_close` sets an internal `closing` flag under the spinlock, then:
+- **kqueue backend:** closes the kqueue fd — this interrupts any concurrent `kevent()` blocking in another thread. The interrupted `epoll_wait` detects the `closing` flag on return and exits with `EBADF`.
+- **select/poll backends:** writes to the self-waking pipe — this interrupts any concurrent `select()`/`poll()`. The interrupted `epoll_wait` detects the `closing` flag and exits with `EBADF`.
+- All subsequent `epoll_ctl`/`epoll_wait` calls on the same handle also return `EBADF` immediately.
+
+**⚠️ Best practice:** While the library now handles concurrent `epoll_close` safely, production code should still ensure only one thread calls `epoll_close` per handle — the closing-flag mechanism is a safety net, not a license to race.
+
 **Platform notes:**
 - **Linux:** calls `close(efd)` directly. `errno` may reflect `close(2)` errors.
 - **kqueue:** closes the kqueue fd then frees the `epoll_t` struct. Returns `-1` if `efd ≤ 0` or the internal fd is invalid.
 - **select:** closes both ends of the self-waking pipe then frees the `epoll_t` struct.
+- **poll (pepoll):** closes both ends of the self-waking pipe, frees the dynamic entries/pollfds arrays, then frees the `epoll_t` struct.
 - **Windows (wepoll):** closes the underlying IOCP port.
 
 ---
@@ -376,7 +385,8 @@ When multiple threads call `epoll_wait` on the same instance, and an ET fd becom
 ## Thread Safety
 
 - `epoll_ctl` and `epoll_wait` are **thread-safe** on the same epoll instance. Internal data is protected by a spinlock (see below).
-- `epoll_create`/`epoll_create1`/`epoll_close` are **not** intended for concurrent use on the same handle.
+- `epoll_close` is **best-effort safe** — it sets an internal `closing` flag under the spinlock, interrupts any blocking system call in another thread (via kqueue fd close or self-waking pipe), and subsequent operations on the handle return `EBADF` immediately.
+- `epoll_create`/`epoll_create1` should not be called concurrently with other operations on the same instance (there's nothing to race on — the handle isn't published yet).
 - `epoll_allocator` must be called **before** any other function and must **not** be called concurrently with any other epoll operation.
 
 ### Spinlock Implementation
@@ -413,9 +423,9 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 
 ## Platform-Specific Limitations
 
-| Feature | Linux | macOS/BSD (kqueue) | Windows (wepoll) | Other POSIX (select) | Other POSIX (poll/pepoll) |
+| Feature | Linux | macOS/BSD (kqueue) | Windows (wepoll) | POSIX (select/uepoll) | POSIX (poll/pepoll) |
 |---|---|---|---|---|---|
-| Max fds | Kernel limit | 1024 (`EPOLL_MAX_EVENTS`) | System limit | 1024 (`FD_SETSIZE`) | **unlimited** (RLIMIT_NOFILE) |
+| Max fds | Kernel limit | 4096 (`EPOLL_MAX_EVENTS`) | System limit | 1024 (`FD_SETSIZE`) | **unlimited** (RLIMIT_NOFILE) |
 | `EPOLLET` | ✅ | ✅ (→ `EV_CLEAR`) | ❌ | ❌ | ❌ |
 | `EPOLLHUP` | ✅ | ✅ (EV_EOF → `EPOLLHUP`) | ❌ | ❌ | ✅ (via POLLHUP) |
 | `EPOLLRDHUP` | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -424,6 +434,7 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 | Non-socket fds | ✅ | ✅ | ❌ (sockets/pipes only) | ✅ | ✅ |
 | `epoll_event._nouse` | N/A | N/A | ❌ (no such field) | ✅ (internal) | ✅ (internal) |
 | Thread safety | kernel | spinlock | kernel + lock | spinlock | spinlock |
+| epoll_close safe | N/A (kernel) | ✅ (closing flag) | ✅ (closing flag) | ✅ (closing flag) | ✅ (closing flag) |
 | Timeout precision | ms | ms (timespec) | ms | ms (timeval) | **ms directly** (poll) |
 | Self-waking | kernel | N/A | N/A | pipe | pipe |
 
@@ -441,6 +452,9 @@ Or compile directly:
 ```bash
 # Linux (kernel epoll)
 gcc -I include/epoll src/epoll.c test/main.c -o main
+
+# Linux (force poll fallback for testing)
+gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o main
 
 # Linux (force select fallback for testing)
 gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/uepoll.c test/main.c -o main
@@ -463,4 +477,8 @@ cl /I include/epoll src/wepoll.c test/main.c
 
 # Windows (IOCP, MinGW)
 gcc -I include/epoll src/wepoll.c test/main.c -o main.exe -lws2_32
+
+# Enable AddressSanitizer for debugging
+cmake -S . -B build -DENABLE_ASAN=ON
+cmake --build build
 ```

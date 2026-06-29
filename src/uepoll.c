@@ -98,6 +98,7 @@ struct epoll_t
   int nfds;
   int pipes[2];
   epoll_lock_t lock;
+  volatile int closing;
   fd_set rset;
   fd_set wset;
   fd_set eset;
@@ -200,6 +201,11 @@ static inline
 int uepoll_del(struct epoll_t* ep, SOCKET fd)
 {
   epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
   if (!uepoll_has_fd(ep, fd)) {
     errno = ENOENT; /* 删除`fd`之前没有注册过. */
     epoll_spinlock_unlock(&ep->lock);
@@ -224,6 +230,11 @@ static inline
 int uepoll_add(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
 {
   epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
   if (uepoll_has_fd(ep, fd)) {
     errno = EEXIST; /* 不能重复调用`EPOLL_CTL_ADD`注册同一个`fd`. */
     epoll_spinlock_unlock(&ep->lock);
@@ -267,6 +278,11 @@ static inline
 int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
 {
   epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
   if (!uepoll_has_fd(ep, fd)) {
     errno = ENOENT; /* 修改`fd`之前没注册过. */
     epoll_spinlock_unlock(&ep->lock);
@@ -312,7 +328,7 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
   errno = 0;
 
-  if (efd <= 0 || fd <= (SOCKET)~0) {
+  if (efd <= 0 || fd < 0) {
     errno = EBADF;
     return EPOLL_INVALID;
   }
@@ -351,6 +367,18 @@ int epoll_close(HANDLE efd)
   }
 
   struct epoll_t* ep = (struct epoll_t*)efd;
+
+  epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
+  ep->closing = 1;
+  /* Wake any select() blocked in epoll_wait */
+  write(ep->pipes[1], "x", 1);
+  epoll_spinlock_unlock(&ep->lock);
+
   close(ep->pipes[0]); ep->pipes[0] = -1;
   close(ep->pipes[1]); ep->pipes[1] = -1;
   epoll_free(ep);
@@ -378,6 +406,7 @@ HANDLE epoll_create1(int flags)
     errno = ENOMEM;
     return -1;
   }
+  memset(ep, 0, sizeof(struct epoll_t));
   ep->pipes[0] = ep->pipes[1] = -1;
   if (pipe(ep->pipes)) {
     epoll_close((HANDLE)ep);
@@ -441,6 +470,12 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
     int nevents = 0; struct epoll_event* ev;
     r = select(nfds, &rset, &wset, &eset, tp);
+
+    /* Check for concurrent epoll_close */
+    epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) { epoll_spinlock_unlock(&ep->lock); return EPOLL_INVALID; }
+    epoll_spinlock_unlock(&ep->lock);
+
     if (r > 0)
     { // select 返回的是事件数量, 不是文件描述符的数量.
       if (FD_ISSET(ep->pipes[0], &rset)) {
@@ -484,7 +519,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
               FD_CLR(fd, &ep->rset);
               FD_CLR(fd, &ep->wset);
               FD_CLR(fd, &ep->eset);
-              ep->udata[fd]._nouse = 0;
+              ep->udata[fd]._nouse = 1;
               ep->udata[fd].events = EPOLLEMPTY;
               ep->udata[fd].data.ptr = NULL;
             }

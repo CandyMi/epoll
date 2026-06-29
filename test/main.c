@@ -22,6 +22,7 @@
   #include <unistd.h>
   #include <sys/time.h>
   #include <sys/socket.h>
+  #include <pthread.h>
 #endif
 
 #include <assert.h>
@@ -451,6 +452,59 @@ EPOLL_TEST_FUNCTION(testcase_epoll_pri, {
     }
     close(sv[0]); close(sv[1]); epoll_close(efd);
 })
+/* ── Concurrent test (pthreads) ────────────────────────────────────── */
+
+struct concurrent_ctx {
+    HANDLE efd;
+    int write_fd;
+    volatile int started;
+};
+
+static void* concurrent_writer(void *arg) {
+    struct concurrent_ctx *ctx = (struct concurrent_ctx *)arg;
+    ctx->started = 1;
+    /* small delay so main thread enters epoll_wait first */
+    struct timespec ts = {0, 5000000};  /* 5 ms */
+    nanosleep(&ts, NULL);
+    write(ctx->write_fd, "x", 1);
+    return NULL;
+}
+
+EPOLL_TEST_FUNCTION(testcase_epoll_concurrent, {
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+    int fds[2]; pipe(fds);
+    int RPIPE = fds[0];
+    int WPIPE = fds[1];
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN; ev.data.fd = RPIPE;
+    int r = epoll_ctl(efd, EPOLL_CTL_ADD, RPIPE, &ev);
+    assert(r == 0);
+
+    struct concurrent_ctx ctx;
+    ctx.efd = efd;
+    ctx.write_fd = WPIPE;
+    ctx.started = 0;
+
+    pthread_t thr;
+    r = pthread_create(&thr, NULL, concurrent_writer, &ctx);
+    assert(r == 0);
+
+    /* Wait for thread to confirm it started */
+    while (!ctx.started) {}
+
+    /* Block in epoll_wait — the writer thread will wake us up */
+    struct epoll_event event[1];
+    r = epoll_wait(efd, event, 1, -1);
+    assert(r == 1);
+    assert(event[0].events & EPOLLIN);
+    assert(event[0].data.fd == RPIPE);
+
+    pthread_join(thr, NULL);
+    close(WPIPE); close(RPIPE); epoll_close(efd);
+})
+
 #endif /* !WIN32 */
 
 /* ── Platform-neutral tests (no pipes/sockets) ────────────────────────── */
@@ -505,6 +559,7 @@ int main(int argc, char const *argv[])
     testcase_epoll_create1_flag();
     testcase_epoll_merge();
     testcase_epoll_pri();
+    testcase_epoll_concurrent();
 #endif
     return 0;
 }

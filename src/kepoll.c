@@ -72,6 +72,7 @@ struct epoll_t
 {
   int efd;
   epoll_lock_t lock;
+  volatile int closing;         /* 1 = epoll_close in progress */
   struct kevent *kqevents;      /* heap-allocated kevent buffer, sized EPOLL_MAX_EVENTS */
 };
 
@@ -92,14 +93,29 @@ static inline int kepoll_ensure_kqevents(struct epoll_t *ep) {
 
 int epoll_close(HANDLE efd)
 {
-  if (efd <= 0)
+  if (efd <= 0) {
+    errno = EBADF;
     return -1;
+  }
   struct epoll_t* ep = (struct epoll_t*)efd;
-  if (ep->efd <= 0)
+
+  epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
     return -1;
+  }
+  ep->closing = 1;
+  int saved_efd = ep->efd;
+  ep->efd = -1;
+  epoll_spinlock_unlock(&ep->lock);
+
+  /* close the kqueue fd — this interrupts any kevent() in another thread */
+  if (saved_efd > 0)
+    close(saved_efd);
+
   epoll_free(ep->kqevents);
   ep->kqevents = NULL;
-  close(ep->efd);
   epoll_free(ep);
   return 0;
 }
@@ -131,6 +147,7 @@ HANDLE epoll_create1(int flags)
     close(efd);
     return -1;
   }
+  memset(ep, 0, sizeof(struct epoll_t));
   ep->efd = efd;
   ep->kqevents = NULL;
   epoll_spinlock_init(&ep->lock);
@@ -242,7 +259,7 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
   errno = 0;
 
-  if (efd <= 0 || fd <= (SOCKET)~0) {
+  if (efd <= 0 || fd < 0) {
     errno = EBADF;
     return EPOLL_INVALID;
   }
@@ -255,6 +272,14 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
   if (!(epoll_op_in(op))) {
     errno = EINVAL;
     return EPOLL_INVALID;
+  }
+
+  /* Reject operations on a closing epoll instance */
+  { struct epoll_t *__ep = (struct epoll_t *)efd;
+    epoll_spinlock_lock(&__ep->lock);
+    int __closing = __ep->closing;
+    epoll_spinlock_unlock(&__ep->lock);
+    if (__closing) { errno = EBADF; return EPOLL_INVALID; }
   }
 
   switch (op)
@@ -300,9 +325,29 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   }
 
   struct epoll_t *ep = (struct epoll_t *)efd;
+
+  /* Capture local copies under lock — safe from concurrent epoll_close */
+  epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
+  int local_efd = ep->efd;
   struct kevent *kqevents = ep->kqevents;
+  epoll_spinlock_unlock(&ep->lock);
+
   struct epoll_event *ev;
-  int nevents = kevent(ep->efd, NULL, 0, kqevents, maxevents, tsp);
+  int nevents = kevent(local_efd, NULL, 0, kqevents, maxevents, tsp);
+
+  /* Check for concurrent close — kevent may have been interrupted */
+  epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
+  epoll_spinlock_unlock(&ep->lock);
   // printf("nevents = %d\n", nevents);
   if (nevents > 0)
   {

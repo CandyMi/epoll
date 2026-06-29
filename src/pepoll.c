@@ -169,6 +169,7 @@ struct epoll_t {
     bool              edited;       /* true if epoll_ctl modified state since last drain */
     int               pipes[2];     /* self-waking pipe (write to wake, read to drain) */
     epoll_lock_t      lock;
+    volatile int      closing;      /* 1 = epoll_close in progress */
 
     int               capacity;     /* allocated size of arrays */
     int               nfds;         /* number of active entries (including pipe slot 0) */
@@ -346,6 +347,11 @@ static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *e
     }
 
     epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+        epoll_spinlock_unlock(&ep->lock);
+        errno = EBADF;
+        return EPOLL_INVALID;
+    }
     if (ppoll_find_slot(ep, fd) >= 0) {
         epoll_spinlock_unlock(&ep->lock);
         errno = EEXIST;
@@ -388,6 +394,11 @@ static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *e
 static inline int ppoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
 {
     epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+        epoll_spinlock_unlock(&ep->lock);
+        errno = EBADF;
+        return EPOLL_INVALID;
+    }
     int slot = ppoll_find_slot(ep, fd);
     if (slot < 0) {
         epoll_spinlock_unlock(&ep->lock);
@@ -403,6 +414,11 @@ static inline int ppoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *e
 static inline int ppoll_del(struct epoll_t *ep, SOCKET fd)
 {
     epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+        epoll_spinlock_unlock(&ep->lock);
+        errno = EBADF;
+        return EPOLL_INVALID;
+    }
     int slot = ppoll_find_slot(ep, fd);
     if (slot < 0) {
         epoll_spinlock_unlock(&ep->lock);
@@ -421,19 +437,13 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
     errno = 0;
 
-    if (efd <= 0 || fd <= (SOCKET)~0) {
+    if (efd <= 0 || fd < 0) {
         errno = EBADF;
         return EPOLL_INVALID;
     }
 
     if (op != EPOLL_CTL_DEL && !event) {
         errno = EFAULT;
-        return EPOLL_INVALID;
-    }
-
-    /* fd < 0 check (SOCKET is signed on non-Windows) */
-    if (fd < 0) {
-        errno = EBADF;
         return EPOLL_INVALID;
     }
 
@@ -458,6 +468,17 @@ int epoll_close(HANDLE efd)
     }
 
     struct epoll_t *ep = (struct epoll_t *)efd;
+
+    epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+        epoll_spinlock_unlock(&ep->lock);
+        errno = EBADF;
+        return EPOLL_INVALID;
+    }
+    ep->closing = 1;
+    /* Wake any poll() blocked in epoll_wait */
+    write(ep->pipes[1], "x", 1);
+    epoll_spinlock_unlock(&ep->lock);
 
     close(ep->pipes[0]); ep->pipes[0] = -1;
     close(ep->pipes[1]); ep->pipes[1] = -1;
@@ -605,6 +626,17 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             poll_start = ppoll_now_ms();
 
         int r = poll(working, (nfds_t)nfds, timeout);
+
+        /* ── Check for concurrent epoll_close after poll returns ── */
+        epoll_spinlock_lock(&ep->lock);
+        if (ep->closing) {
+            epoll_spinlock_unlock(&ep->lock);
+            if (heap) { epoll_free(working); heap = false; }
+            errno = EBADF;
+            return EPOLL_INVALID;
+        }
+        epoll_spinlock_unlock(&ep->lock);
+
         if (r < 0) {
             /* EINTR is the only recoverable error — retry with decay. */
             if (errno == EINTR) {
@@ -622,6 +654,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
         if (r == 0) {
             /* Timeout with no events */
+            if (heap) { epoll_free(working); heap = false; working = wstack; }
             return 0;
         }
 

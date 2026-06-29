@@ -34,6 +34,14 @@ jobs:
       - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/uepoll.c test/main.c -o build/select_main
       - run: ./build/select_main
 
+  linux-pepoll:
+    name: "Linux · GCC · poll fallback (pepoll)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o build/poll_main
+      - run: ./build/poll_main
+
   # ── macOS ─────────────────────────────────────
   macos-clang:
     name: "macOS · Clang · kqueue"
