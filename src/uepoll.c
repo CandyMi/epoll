@@ -1,3 +1,27 @@
+/*
+**  LICENSE: MIT
+**  Author: CandyMi[https://github.com/candymi]
+**
+**  uepoll.c — select(2)-based epoll emulation for generic POSIX systems.
+**
+**  Falls back to select(2) when neither kernel epoll nor kqueue is
+**  available.  Limited to FD_SETSIZE (default 1024) fds.
+**
+**  Key design:
+**    • 3 × fd_set (rset / wset / eset) + udata[FD_SETSIZE] array
+**    • Self-waking pipe for cross-thread epoll_ctl → epoll_wait wake
+**    • Spinlock (3-level degrading) for thread safety
+**    • ONESHOT support via fd_set removal after first event
+**
+**  Limitations:
+**    • EPOLLET / EPOLLHUP / EPOLLPRI unsupported (select cannot detect)
+**    • fd capped at FD_SETSIZE
+**    • Timeout converted from ms → timeval each call
+**
+**  This is the original universal fallback; ppoll.c is the recommended
+**  replacement on any system with poll(2).
+*/
+
 #ifndef _GNU_SOURCE
   #define _GNU_SOURCE
 #endif

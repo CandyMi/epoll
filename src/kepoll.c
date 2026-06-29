@@ -1,3 +1,21 @@
+/*
+**  LICENSE: MIT
+**  Author: CandyMi[https://github.com/candymi]
+**
+**  kepoll.c — kqueue-based epoll emulation for BSD / Darwin (macOS).
+**
+**  Translates the epoll API to kqueue / kevent:
+**    • EPOLLIN / EPOLLOUT → EVFILT_READ / EVFILT_WRITE
+**    • EPOLLET → EV_CLEAR
+**    • EPOLLONESHOT → EV_ONESHOT
+**    • EPOLLPRI → EVFILT_EXCEPT | NOTE_OOB (macOS only)
+**
+**  Merges adjacent same-fd READ+WRITE events into a single epoll_event.
+**  Pre-allocates a heap kevent buffer (EPOLL_MAX_EVENTS) to avoid alloca.
+**
+**  Selected on BSD / Darwin systems.
+*/
+
 #include "uepoll.h"
 
 // #include <stdio.h>
