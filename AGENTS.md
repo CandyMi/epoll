@@ -246,6 +246,60 @@ Platform-specific code is guarded with `#ifndef WIN32`.
 8. **Self-waking pipe fd drain:** The pipe read end (`pipes[0]`) is registered in the epoll instance itself. The drain loop uses a 1024-byte buffer and reads in a `while` loop — fully clearing the pipe under heavy concurrent modification.
 9. **Concurrent `epoll_close` safety:** All non-Linux backends now detect concurrent close via a `closing` flag and interrupt blocking waits. However, production code should still ensure only one thread calls `epoll_close` per handle — the mechanism is a safety net, not a license to race.
 
+## Git Commit Convention
+
+All commits must follow **Conventional Commits** format with English-only messages:
+
+```
+<type>: <imperative present tense summary>
+
+- <bullet point detail>
+- <bullet point detail>
+...
+```
+
+### Types
+
+| Type | When to use |
+|---|---|
+| `feat` | New feature or backend |
+| `fix` | Bug fix, safety fix, memory leak |
+| `docs` | Documentation only (README, api.md, AGENTS.md) |
+| `refactor` | Code restructuring with no behavior change |
+| `test` | Adding or fixing tests |
+| `ci` | CI workflow changes |
+| `chore` | Build system, tooling, gitignore |
+
+### Rules
+
+1. **Language:** English only — subject line, body, and bullets.
+2. **Subject line:** ≤ 72 chars, imperative present tense (`fix`, `add`, `update`, not `fixed`, `added`, `updated`). Lowercase after `<type>:`. No trailing period.
+3. **Body bullets:** Each bullet starts with a lowercase verb. Use present tense. Reference files or symbols when relevant.
+4. **Scope annotation:** Optional but encouraged for cross-cutting changes — e.g. `fix(uepoll):`, `docs(api):`, `ci:`.
+5. **No Chinese in commit messages.** In-code comments can be Chinese (project heritage), but the git log must be readable by any contributor globally.
+
+### Examples
+
+```
+fix(kepoll): prevent race in kevent output buffer access
+
+- capture local_efd and kqevents under spinlock before kevent()
+- check ep->closing flag after kevent returns
+- close kqueue fd to interrupt concurrent blocking calls
+
+docs(readme): add backend selection table and quick start
+
+- document all 5 backends with platform mapping
+- add runnable Quick Start example
+- add Thread Safety section with closing-flag behavior
+
+feat: add pepoll (poll) backend as default POSIX fallback
+
+- dynamic pollfd array with free-list for O(1) slot alloc
+- stack or per-call heap working buffer (≤256 fds on stack)
+- self-waking pipe for cross-thread epoll_ctl → epoll_wait wake
+```
+
 ## Modification Guide
 
 - **Adding a new backend:** Create `new_backend.c`, add an `#elif` branch in `epoll.h`, add an `elseif` build rule in `CMakeLists.txt`.
