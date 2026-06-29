@@ -245,8 +245,9 @@ Wait for events on the epoll instance.
 - `timeout > 0`: Block for up to `timeout` milliseconds.
 
 **Platform notes:**
-- **kqueue backend:** `maxevents` is internally capped at `EPOLL_MAX_EVENTS` (1024). If the actual number of kqueue events exceeds `maxevents`, the merge logic may truncate results.
-- **select backend:** If the self-waking pipe triggers (from a concurrent `epoll_ctl` call), `epoll_wait` recalculates the remaining timeout and retries.
+- **kqueue backend:** `maxevents` is internally capped at `EPOLL_MAX_EVENTS` (4096). Uses a per-call kevent buffer (stack ≤ 256 events, heap fallback) — multiple threads can call `epoll_wait` concurrently on the same instance.
+- **select backend:** Uses per-call stack copies of `fd_set` — multiple threads can call `epoll_wait` concurrently. If the self-waking pipe triggers (from a concurrent `epoll_ctl` call), `epoll_wait` recalculates the remaining timeout and retries.
+- **poll backend (pepoll):** Uses per-call stack (≤256 fds) or per-call heap working buffer — multiple threads can call `epoll_wait` concurrently.
 
 ---
 
@@ -384,7 +385,7 @@ When multiple threads call `epoll_wait` on the same instance, and an ET fd becom
 
 ## Thread Safety
 
-- `epoll_ctl` and `epoll_wait` are **thread-safe** on the same epoll instance. Internal data is protected by a spinlock (see below).
+- `epoll_ctl` and `epoll_wait` are **thread-safe** on the same epoll instance. Internal data is protected by a spinlock (see below) and all blocking system calls use per-thread output buffers.
 - `epoll_close` is **best-effort safe** — it sets an internal `closing` flag under the spinlock, interrupts any blocking system call in another thread (via kqueue fd close or self-waking pipe), and subsequent operations on the handle return `EBADF` immediately.
 - `epoll_create`/`epoll_create1` should not be called concurrently with other operations on the same instance (there's nothing to race on — the handle isn't published yet).
 - `epoll_allocator` must be called **before** any other function and must **not** be called concurrently with any other epoll operation.
@@ -433,10 +434,10 @@ All functions return `-1` on error and set `errno` appropriately. Standard errno
 | `EPOLLONESHOT` | ✅ | ✅ (→ `EV_ONESHOT`) | ✅ | ✅ | ✅ |
 | Non-socket fds | ✅ | ✅ | ❌ (sockets/pipes only) | ✅ | ✅ |
 | `epoll_event._nouse` | N/A | N/A | ❌ (no such field) | ✅ (internal) | ✅ (internal) |
-| Thread safety | kernel | spinlock | kernel + lock | spinlock | spinlock |
+| Concurrent epoll_wait | ✅ (kernel) | ✅ (per-call buffer) | ✅ (IOCP) | ✅ (per-call fd_set) | ✅ (per-call buffer) |
 | epoll_close safe | N/A (kernel) | ✅ (closing flag) | ✅ (closing flag) | ✅ (closing flag) | ✅ (closing flag) |
 | Timeout precision | ms | ms (timespec) | ms | ms (timeval) | **ms directly** (poll) |
-| Self-waking | kernel | N/A | N/A | pipe | pipe |
+| Self-waking | kernel | N/A (close-fd interrupt) | N/A | pipe | pipe |
 
 ---
 

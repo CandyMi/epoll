@@ -138,7 +138,7 @@ Only **one** `.c` file is compiled per platform. All backends implement the iden
 | Operation | Safe to call concurrently? | Mechanism |
 |---|---|---|
 | `epoll_ctl` | ✅ Yes | Spinlock protects all internal data |
-| `epoll_wait` | ✅ Yes | State snapshot taken under lock; system call runs lock-free |
+| `epoll_wait` | ✅ Yes | State snapshot taken under lock; system call uses per-thread output buffer (stack or per-call heap) — **all backends** |
 | `epoll_close` | ✅ Best-effort | Sets `closing` flag under lock, interrupts blocking syscall, subsequent ops return `EBADF` |
 | `epoll_create` / `epoll_create1` | ✅ Yes (handle not yet shared) | Single-threaded initialisation |
 | `epoll_allocator` | ❌ No | Must be called once, before any other function |

@@ -11,7 +11,8 @@
 **    • EPOLLPRI → EVFILT_EXCEPT | NOTE_OOB (macOS only)
 **
 **  Merges adjacent same-fd READ+WRITE events into a single epoll_event.
-**  Pre-allocates a heap kevent buffer (EPOLL_MAX_EVENTS) to avoid alloca.
+**  Uses a per-call kevent buffer (stack ≤ 256, heap otherwise) so multiple
+**  threads can call epoll_wait concurrently on the same epoll instance.
 **
 **  Selected on BSD / Darwin systems.
 */
@@ -29,7 +30,10 @@
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/event.h>
-// alloca removed — kqevents now lives on the heap
+
+/* Per-call kevent buffer: stack for ≤ 256 events, heap fallback for larger.
+ * sizeof(struct kevent) ≈ 32 bytes on 64-bit, so stack cost ≈ 8 KB. */
+#define KE_STACK_NEVENTS 256
 
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
@@ -73,7 +77,7 @@ struct epoll_t
   int efd;
   epoll_lock_t lock;
   volatile int closing;         /* 1 = epoll_close in progress */
-  struct kevent *kqevents;      /* heap-allocated kevent buffer, sized EPOLL_MAX_EVENTS */
+  /* No shared kevent buffer — epoll_wait uses per-call stack or heap */
 };
 
 static epoll_realloc_t epoll_realloc = realloc;
@@ -81,14 +85,6 @@ void epoll_allocator(epoll_realloc_t alloc)
 {
   if (!alloc) return;
   epoll_realloc = alloc;
-}
-
-static inline int kepoll_ensure_kqevents(struct epoll_t *ep) {
-  if (!ep->kqevents) {
-    ep->kqevents = (struct kevent*)epoll_malloc(sizeof(struct kevent) * EPOLL_MAX_EVENTS);
-    if (!ep->kqevents) return -1;
-  }
-  return 0;
 }
 
 int epoll_close(HANDLE efd)
@@ -114,8 +110,6 @@ int epoll_close(HANDLE efd)
   if (saved_efd > 0)
     close(saved_efd);
 
-  epoll_free(ep->kqevents);
-  ep->kqevents = NULL;
   epoll_free(ep);
   return 0;
 }
@@ -149,15 +143,7 @@ HANDLE epoll_create1(int flags)
   }
   memset(ep, 0, sizeof(struct epoll_t));
   ep->efd = efd;
-  ep->kqevents = NULL;
   epoll_spinlock_init(&ep->lock);
-  /* pre-allocate kevent buffer to avoid alloca on every epoll_wait */
-  if (kepoll_ensure_kqevents(ep) != 0) {
-    errno = ENOMEM;
-    close(efd);
-    epoll_free(ep);
-    return -1;
-  }
   return (HANDLE)ep;
 }
 
@@ -326,15 +312,31 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
   struct epoll_t *ep = (struct epoll_t *)efd;
 
+  /* Per-call kevent buffer — each thread gets its own, no shared state.
+   * Stack for small sets (≤ KE_STACK_NEVENTS), heap otherwise.
+   * This makes concurrent epoll_wait safe (unlike a shared buffer). */
+  struct kevent  kstack[KE_STACK_NEVENTS];
+  struct kevent *kqevents = kstack;
+  bool           heap     = false;
+
+  if (maxevents > KE_STACK_NEVENTS) {
+    kqevents = (struct kevent *)epoll_malloc((size_t)maxevents * sizeof(struct kevent));
+    if (!kqevents) {
+      errno = ENOMEM;
+      return EPOLL_INVALID;
+    }
+    heap = true;
+  }
+
   /* Capture local copies under lock — safe from concurrent epoll_close */
   epoll_spinlock_lock(&ep->lock);
   if (ep->closing) {
     epoll_spinlock_unlock(&ep->lock);
+    if (heap) epoll_free(kqevents);
     errno = EBADF;
     return EPOLL_INVALID;
   }
   int local_efd = ep->efd;
-  struct kevent *kqevents = ep->kqevents;
   epoll_spinlock_unlock(&ep->lock);
 
   struct epoll_event *ev;
@@ -344,6 +346,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   epoll_spinlock_lock(&ep->lock);
   if (ep->closing) {
     epoll_spinlock_unlock(&ep->lock);
+    if (heap) epoll_free(kqevents);
     errno = EBADF;
     return EPOLL_INVALID;
   }
@@ -403,5 +406,6 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     }
     nevents = nkqevents;
   }
+  if (heap) epoll_free(kqevents);
   return nevents;
 }

@@ -82,7 +82,7 @@ epoll/
 
 ### kepoll.c — kqueue Backend
 
-- **HANDLE is a pointer**: `struct epoll_t` wraps a kqueue fd + spinlock + `volatile int closing` + heap-allocated `kqevents[]` buffer. `epoll_create1` pre-allocates the kevent buffer (sized `EPOLL_MAX_EVENTS = 4096`) to avoid `alloca()` on every `epoll_wait`. On OOM, the kqueue fd is closed and the allocation is freed.
+- **HANDLE is a pointer**: `struct epoll_t` wraps a kqueue fd + spinlock + `volatile int closing`. No shared output buffer — `epoll_wait` uses a **per-call** kevent buffer (stack ≤ 256 events, heap fallback for larger sets) so multiple threads can call `epoll_wait` concurrently on the same instance.
 - **Event mapping**: `EPOLLIN|RDNORM|RDBAND|ERR|HUP → EVFILT_READ`, `EPOLLOUT|WRNORM|WRBAND → EVFILT_WRITE`. Non-requested filters are registered as `EV_DISABLE`. `EPOLLERR`/`EPOLLHUP` also enable `EVFILT_READ` so EOF/error can be detected.
 - **EPOLLPRI support**: `EPOLLPRI → EVFILT_EXCEPT | NOTE_OOB` via a separate `kevent()` call (isolated from pipe-unsupported `EINVAL`). Guarded by `#if defined(EVFILT_EXCEPT) && defined(NOTE_OOB)` — only available on macOS; FreeBSD and other BSDs skip EPOLLPRI.
 - **Event merging**: kqueue returns separate READ/WRITE events for the same fd. A `uintptr_t before_fd` cache merges adjacent same-fd events into a single `epoll_event`. ERROR/EOF/ONESHOT events are handled separately and counted in the return value.
