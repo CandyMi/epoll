@@ -125,6 +125,15 @@ epoll/
 - `epoll_event` has **no `_nouse` field**, unlike the uepoll variant.
 - `epoll_allocator` is a no-op — wepoll uses `malloc`/`free` directly. Substituting the allocator has no effect on this backend.
 
+#### Known Issues (wepoll)
+
+- **[A] `sock <= (SOCKET)~0` 无符号溢出** (`src/wepoll.c:551`, commit `b67df35`). `(SOCKET)~0` = `INVALID_SOCKET` = 类型的最大值（x64: `0xFF..FF`）。`<=` 使所有合法 socket handle 都满足条件 → `epoll_ctl` 拒掉所有 socket。上游 piscisaureus/wepoll 无此校验，改用 `epoll_ctl` → `port_ctl` → `sock_new` 中的 `socket == INVALID_SOCKET`。**修复方案：** `<=` → `==`，但修复后会触发问题 B。
+- **[B] `wake_sock` 注册 → AFD poll 副作用**。A 修成 `==` 后内部 `wake_sock` 可通过 `epoll_ctl`。每个成功注册的 socket 在 `sock_update` 中提交 `NtDeviceIoControlFile(IOCTL_AFD_POLL, timeout=INT64_MAX)`，挂载到 IOCP。`wake_sock` 的 AFD poll completion 干扰 timer/DNS/ICMP 事件的 IOCP 调度，导致 `test_timer/dns/icmp` 超时。
+- **[C] AFD poll 超时交互**。IOCP 双层 timeout：`GetQueuedCompletionStatusEx(timeout=N)` + AFD poll `TimeOut=INT64_MAX`。`wake_sock` 的 AFD poll 完成包可能在 timer 到期前返回，导致 `port_wait` 重入 `port__poll`，多次重入累积误差。
+- **[D] AFD 边缘触发 → 已就绪 socket 死锁** (commit `79fe1aa`)。`AFD_POLL_SEND`/`AFD_POLL_RECEIVE` 仅状态转换时触发，已连接 TCP socket 注册 `EPOLLOUT` 不触发转换 → `epoll_wait` 死锁。**当前修复：** `sock_update` 中 `select()` 零超时探针 + `PostQueuedCompletionStatus` 注入合成完成包。此探针改写了 AFD poll 的提交路径，与问题 B/C 的状态机有交集，回检需纳入。
+
+**依赖关系：** A → B → C；D 与 B/C 共享 AFD poll 状态机但可独立评估。
+
 ## Supported Platforms & Compilers
 
 | Platform | CMake Match | Backend (default) | Mechanism | Override |
