@@ -236,15 +236,16 @@ static inline int ppoll_find_slot(const struct epoll_t *ep, SOCKET fd)
  * Uses epoll_realloc (== realloc semantics) so the allocator may
  * extend in-place — avoiding the malloc+memcpy+free triple of the
  * original design.  On ENOMEM, best-effort rollback is attempted.
- * Returns 0 on success, -1 on ENOMEM. */
+ * Returns 0 on success, -1 on ENOMEM.
+ *
+ * NOTE: caller must ensure new_cap > 0 and that the multiplication
+ * in `ep->capacity * 2` didn't overflow (see ppoll_add_locked). */
 static inline int ppoll_grow(struct epoll_t *ep, int new_cap)
 {
-    if (new_cap > PP_MAX_CAPACITY) {
+    if (new_cap > PP_MAX_CAPACITY || new_cap < PP_INITIAL_CAPACITY) {
         errno = ENOMEM;
         return -1;
     }
-    if (new_cap < PP_INITIAL_CAPACITY)
-        new_cap = PP_INITIAL_CAPACITY;
 
     size_t entry_sz = (size_t)new_cap * sizeof(struct poll_entry);
     size_t pollfd_sz = (size_t)new_cap * sizeof(struct pollfd);
@@ -336,24 +337,22 @@ static inline void ppoll_unregister_locked(struct epoll_t *ep, int slot)
 }
 
 /*
- * ppoll_add / ppoll_mod / ppoll_del — each acquires the lock once,
- * performs the find-then-operate atomically.
+ * ppoll_add_locked / ppoll_mod_locked / ppoll_del_locked —
+ * assume caller (epoll_ctl) already holds ep->lock.
+ * They do NOT release the lock on return — epoll_ctl does.
  */
-static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+static inline int ppoll_add_locked(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
 {
     if (!ppoll_can_poll(fd)) {
         errno = EPERM;
         return EPOLL_INVALID;
     }
-
-    epoll_spinlock_lock(&ep->lock);
+    /* Lock is held by caller */
     if (ep->closing) {
-        epoll_spinlock_unlock(&ep->lock);
         errno = EBADF;
         return EPOLL_INVALID;
     }
     if (ppoll_find_slot(ep, fd) >= 0) {
-        epoll_spinlock_unlock(&ep->lock);
         errno = EEXIST;
         return EPOLL_INVALID;
     }
@@ -361,23 +360,22 @@ static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *e
     /* Pop from free list (O(1)) */
     int slot = ep->free_head;
     if (slot < 0 || (uint32_t)slot >= (uint32_t)ep->capacity) {
-        /* Free list empty — grow outside the lock, then re-check */
-        epoll_spinlock_unlock(&ep->lock);
-        int new_cap = ep->capacity * 2;
+        /* Free list empty — grow.  Keep the lock held so no
+         * concurrent epoll_close can free ep during realloc.
+         * Check for overflow before multiplying. */
+        int new_cap;
+        if (ep->capacity > PP_MAX_CAPACITY / 2) {
+            errno = ENOMEM;
+            return EPOLL_INVALID;
+        }
+        new_cap = ep->capacity * 2;
         if (new_cap < PP_INITIAL_CAPACITY)
             new_cap = PP_INITIAL_CAPACITY;
         if (ppoll_grow(ep, new_cap) != 0)
             return EPOLL_INVALID;
 
-        epoll_spinlock_lock(&ep->lock);
-        if (ppoll_find_slot(ep, fd) >= 0) {
-            epoll_spinlock_unlock(&ep->lock);
-            errno = EEXIST;
-            return EPOLL_INVALID;
-        }
         slot = ep->free_head;
         if (slot < 0 || (uint32_t)slot >= (uint32_t)ep->capacity) {
-            epoll_spinlock_unlock(&ep->lock);
             errno = ENOMEM;
             return EPOLL_INVALID;
         }
@@ -387,48 +385,65 @@ static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *e
     ep->free_head = (int)ep->entries[slot].epoll_events;
 
     ppoll_register_locked(ep, slot, fd, event);
-    epoll_spinlock_unlock(&ep->lock);
     return EPOLL_SUCCESS;
 }
 
-static inline int ppoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+static inline int ppoll_mod_locked(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
 {
-    epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {
-        epoll_spinlock_unlock(&ep->lock);
         errno = EBADF;
         return EPOLL_INVALID;
     }
     int slot = ppoll_find_slot(ep, fd);
     if (slot < 0) {
-        epoll_spinlock_unlock(&ep->lock);
         errno = ENOENT;
         return EPOLL_INVALID;
     }
 
     ppoll_register_locked(ep, slot, fd, event);
-    epoll_spinlock_unlock(&ep->lock);
     return EPOLL_SUCCESS;
 }
 
-static inline int ppoll_del(struct epoll_t *ep, SOCKET fd)
+static inline int ppoll_del_locked(struct epoll_t *ep, SOCKET fd)
 {
-    epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {
-        epoll_spinlock_unlock(&ep->lock);
         errno = EBADF;
         return EPOLL_INVALID;
     }
     int slot = ppoll_find_slot(ep, fd);
     if (slot < 0) {
-        epoll_spinlock_unlock(&ep->lock);
         errno = ENOENT;
         return EPOLL_INVALID;
     }
 
     ppoll_unregister_locked(ep, slot);
-    epoll_spinlock_unlock(&ep->lock);
     return EPOLL_SUCCESS;
+}
+
+/* Public wrappers — each takes lock, delegates to locked variant,
+ * releases lock.  Kept for any direct callers within the file. */
+static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+{
+    epoll_spinlock_lock(&ep->lock);
+    int r = ppoll_add_locked(ep, fd, event);
+    epoll_spinlock_unlock(&ep->lock);
+    return r;
+}
+
+static inline int ppoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+{
+    epoll_spinlock_lock(&ep->lock);
+    int r = ppoll_mod_locked(ep, fd, event);
+    epoll_spinlock_unlock(&ep->lock);
+    return r;
+}
+
+static inline int ppoll_del(struct epoll_t *ep, SOCKET fd)
+{
+    epoll_spinlock_lock(&ep->lock);
+    int r = ppoll_del_locked(ep, fd);
+    epoll_spinlock_unlock(&ep->lock);
+    return r;
 }
 
 /* ── Public API ────────────────────────────────────────────────────── */
@@ -449,15 +464,27 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 
     struct epoll_t *ep = (struct epoll_t *)efd;
 
+    /* Take lock FIRST, then check closing — this prevents the
+     * TOCTOU race where epoll_close could free ep between the
+     * closing check and the internal lock acquisition in the
+     * backend functions.  The locked variants assume lock held
+     * and do NOT release it. */
+    epoll_spinlock_lock(&ep->lock);
+
+    int result;
     switch (op)
     {
-        case EPOLL_CTL_ADD: return ppoll_add(ep, fd, event);
-        case EPOLL_CTL_MOD: return ppoll_mod(ep, fd, event);
-        case EPOLL_CTL_DEL: return ppoll_del(ep, fd);
+        case EPOLL_CTL_ADD: result = ppoll_add_locked(ep, fd, event); break;
+        case EPOLL_CTL_MOD: result = ppoll_mod_locked(ep, fd, event); break;
+        case EPOLL_CTL_DEL: result = ppoll_del_locked(ep, fd); break;
         default:
             errno = EINVAL;
-            return EPOLL_INVALID;
+            result = EPOLL_INVALID;
+            break;
     }
+
+    epoll_spinlock_unlock(&ep->lock);
+    return result;
 }
 
 int epoll_close(HANDLE efd)
@@ -635,9 +662,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             errno = EBADF;
             return EPOLL_INVALID;
         }
-        epoll_spinlock_unlock(&ep->lock);
 
         if (r < 0) {
+            epoll_spinlock_unlock(&ep->lock);
             /* EINTR is the only recoverable error — retry with decay. */
             if (errno == EINTR) {
                 if (timeout > 0) {
@@ -653,6 +680,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         }
 
         if (r == 0) {
+            epoll_spinlock_unlock(&ep->lock);
             /* Timeout with no events */
             if (heap) { epoll_free(working); heap = false; working = wstack; }
             return 0;
@@ -662,6 +690,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         if (working[0].revents & POLLIN) {
             /* Another thread modified the set — drain and restart.
              * Decay remaining timeout if applicable. */
+            epoll_spinlock_unlock(&ep->lock);
             if (timeout > 0) {
                 int64_t elapsed = ppoll_now_ms() - poll_start;
                 if (elapsed > 0) {
@@ -672,8 +701,10 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             continue;
         }
 
-        /* ── Step 4: translate poll revents → epoll events ── */
-        epoll_spinlock_lock(&ep->lock);
+        /* ── Step 4: translate poll revents → epoll events ──
+         * Lock is still held from the closing check above, so no
+         * concurrent epoll_close can free ep between the two. */
+        /* epoll_spinlock_lock now redundant — already held */
         int nevents = 0;
         int remaining = r;
         for (int i = 1; i < nfds && nevents < maxevents && remaining > 0; i++)

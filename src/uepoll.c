@@ -197,53 +197,23 @@ void uepoll_update_nfds(struct epoll_t* ep, SOCKET fd)
   return;
 }
 
+/* Lock-held variants — assume ep->lock is held by epoll_ctl.
+ * EPOLLERR is always enabled (Linux epoll guarantees this). */
 static inline
-int uepoll_del(struct epoll_t* ep, SOCKET fd)
+int uepoll_add_locked(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
 {
-  epoll_spinlock_lock(&ep->lock);
   if (ep->closing) {
-    epoll_spinlock_unlock(&ep->lock);
-    errno = EBADF;
-    return EPOLL_INVALID;
-  }
-  if (!uepoll_has_fd(ep, fd)) {
-    errno = ENOENT; /* 删除`fd`之前没有注册过. */
-    epoll_spinlock_unlock(&ep->lock);
-    return EPOLL_INVALID;
-  }
-
-  FD_CLR(fd, &ep->rset);
-  FD_CLR(fd, &ep->wset);
-  FD_CLR(fd, &ep->eset);
-
-  ep->udata[fd]._nouse = 1;
-  ep->udata[fd].events = EPOLLEMPTY;
-  ep->udata[fd].data.ptr = NULL;
-
-  epoll_notice(ep);
-  uepoll_update_nfds(ep, fd);
-  epoll_spinlock_unlock(&ep->lock);
-  return EPOLL_SUCCESS;
-}
-
-static inline
-int uepoll_add(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
-{
-  epoll_spinlock_lock(&ep->lock);
-  if (ep->closing) {
-    epoll_spinlock_unlock(&ep->lock);
     errno = EBADF;
     return EPOLL_INVALID;
   }
   if (uepoll_has_fd(ep, fd)) {
-    errno = EEXIST; /* 不能重复调用`EPOLL_CTL_ADD`注册同一个`fd`. */
-    epoll_spinlock_unlock(&ep->lock);
+    errno = EEXIST;
     return EPOLL_INVALID;
   }
 
-  ep->udata[fd]._nouse = 0; // 标记`fd`已注册.
-  ep->udata[fd].events = EPOLLEMPTY; // 清空`events`.
-  ep->udata[fd].data.ptr = NULL; // 清空`data`.
+  ep->udata[fd]._nouse = 0;
+  ep->udata[fd].events = EPOLLEMPTY;
+  ep->udata[fd].data.ptr = NULL;
 
   if (ev->events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND)) {
     FD_SET(fd, &ep->rset);
@@ -255,10 +225,9 @@ int uepoll_add(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
     ep->udata[fd].events |= EPOLLOUT;
   }
 
-  if (ev->events & EPOLLERR) {
-    FD_SET(fd, &ep->eset);
-    ep->udata[fd].events |= EPOLLERR;
-  }
+  /* Always monitor EPOLLERR — matches Linux epoll semantics. */
+  FD_SET(fd, &ep->eset);
+  ep->udata[fd].events |= EPOLLERR;
 
   if (uepoll_has_oneshot(ev->events)) {
     ep->udata[fd].events |= EPOLLONESHOT;
@@ -269,28 +238,23 @@ int uepoll_add(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
     uepoll_append_nfds(ep, fd);
     epoll_notice(ep);
   }
-
-  epoll_spinlock_unlock(&ep->lock);
   return EPOLL_SUCCESS;
 }
 
 static inline 
-int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
+int uepoll_mod_locked(struct epoll_t* ep, int fd, struct epoll_event *ev)
 {
-  epoll_spinlock_lock(&ep->lock);
   if (ep->closing) {
-    epoll_spinlock_unlock(&ep->lock);
     errno = EBADF;
     return EPOLL_INVALID;
   }
   if (!uepoll_has_fd(ep, fd)) {
-    errno = ENOENT; /* 修改`fd`之前没注册过. */
-    epoll_spinlock_unlock(&ep->lock);
+    errno = ENOENT;
     return EPOLL_INVALID;
   }
 
-  ep->udata[fd].events = EPOLLEMPTY; // 清空`events`.
-  ep->udata[fd].data.ptr = NULL; // 清空`data`.
+  ep->udata[fd].events = EPOLLEMPTY;
+  ep->udata[fd].data.ptr = NULL;
 
   if (ev->events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND)) {
     FD_SET(fd, &ep->rset);
@@ -306,12 +270,9 @@ int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
     FD_CLR(fd, &ep->wset);
   }
 
-  if (ev->events & EPOLLERR) {
-    FD_SET(fd, &ep->eset);
-    ep->udata[fd].events |= EPOLLERR;
-  } else {
-    FD_CLR(fd, &ep->eset);
-  }
+  /* Always monitor EPOLLERR — matches Linux epoll semantics. */
+  FD_SET(fd, &ep->eset);
+  ep->udata[fd].events |= EPOLLERR;
 
   if (uepoll_has_oneshot(ev->events)) {
     ep->udata[fd].events |= EPOLLONESHOT;
@@ -320,8 +281,60 @@ int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
   ep->udata[fd].data.ptr = ev->data.ptr;
   epoll_notice(ep);
   uepoll_append_nfds(ep, fd);
-  epoll_spinlock_unlock(&ep->lock);
   return EPOLL_SUCCESS;
+}
+
+static inline
+int uepoll_del_locked(struct epoll_t* ep, SOCKET fd)
+{
+  if (ep->closing) {
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
+  if (!uepoll_has_fd(ep, fd)) {
+    errno = ENOENT;
+    return EPOLL_INVALID;
+  }
+
+  FD_CLR(fd, &ep->rset);
+  FD_CLR(fd, &ep->wset);
+  FD_CLR(fd, &ep->eset);
+
+  ep->udata[fd]._nouse = 1;
+  ep->udata[fd].events = EPOLLEMPTY;
+  ep->udata[fd].data.ptr = NULL;
+
+  epoll_notice(ep);
+  uepoll_update_nfds(ep, fd);
+  return 0;
+}
+
+/* Public wrappers — take lock, delegate, release */
+static inline
+int uepoll_add(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
+{
+  epoll_spinlock_lock(&ep->lock);
+  int r = uepoll_add_locked(ep, fd, ev);
+  epoll_spinlock_unlock(&ep->lock);
+  return r;
+}
+
+static inline 
+int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
+{
+  epoll_spinlock_lock(&ep->lock);
+  int r = uepoll_mod_locked(ep, fd, ev);
+  epoll_spinlock_unlock(&ep->lock);
+  return r;
+}
+
+static inline
+int uepoll_del(struct epoll_t* ep, SOCKET fd)
+{
+  epoll_spinlock_lock(&ep->lock);
+  int r = uepoll_del_locked(ep, fd);
+  epoll_spinlock_unlock(&ep->lock);
+  return r;
 }
 
 int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
@@ -334,7 +347,7 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
   }
 
   if (fd < 0 || fd >= EPOLL_MAX_EVENTS) {
-    errno = ENOSPC; // `fd`必须在0~FD_SETSIZE之间.
+    errno = ENOSPC;
     return EPOLL_INVALID;
   }
 
@@ -344,19 +357,27 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
   }
 
   if (!uepoll_can_poll(fd)) {
-    errno = EPERM; // 不支持的`fd`类型.
+    errno = EPERM;
     return EPOLL_INVALID;
   }
 
+  /* Take lock FIRST — prevents the TOCTOU race where epoll_close
+   * could free ep between a pre-check and the internal lock acquisition
+   * in the backend functions.  Locked variants assume lock held. */
+  struct epoll_t* ep = (struct epoll_t*)efd;
+  epoll_spinlock_lock(&ep->lock);
+
+  int result;
   switch (op)
   {
-    case EPOLL_CTL_ADD: return uepoll_add((struct epoll_t*)efd, fd, event);
-    case EPOLL_CTL_DEL: return uepoll_del((struct epoll_t*)efd, fd);
-    case EPOLL_CTL_MOD: return uepoll_mod((struct epoll_t*)efd, fd, event);
+    case EPOLL_CTL_ADD: result = uepoll_add_locked(ep, fd, event); break;
+    case EPOLL_CTL_DEL: result = uepoll_del_locked(ep, fd); break;
+    case EPOLL_CTL_MOD: result = uepoll_mod_locked(ep, fd, event); break;
+    default: errno = EINVAL; result = EPOLL_INVALID; break;
   }
-  errno = EINVAL;
-  // `op`必须是EPOLL_CTL_ADD, EPOLL_CTL_DEL或EPOLL_CTL_MOD.
-  return EPOLL_INVALID;
+
+  epoll_spinlock_unlock(&ep->lock);
+  return result;
 }
 
 int epoll_close(HANDLE efd)
@@ -462,8 +483,8 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     // printf("struct timeval ts {%zd, %zd}\n", ts.tv_sec, ts.tv_usec);
 
     epoll_spinlock_lock(&ep->lock);
-    epoll_receive(ep); /* 每次监听前必须重置状态（多一次系统调用） */
-    fd_set rset, wset, eset; /* 使用复制拷贝来解决多线程竞争的问题 */
+    epoll_receive(ep);
+    fd_set rset, wset, eset;
     int nfds = ep->nfds;
     FD_COPY(&ep->rset, &rset); FD_COPY(&ep->wset, &wset); FD_COPY(&ep->eset, &eset);
     epoll_spinlock_unlock(&ep->lock);
@@ -471,28 +492,38 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     int nevents = 0; struct epoll_event* ev;
     r = select(nfds, &rset, &wset, &eset, tp);
 
-    /* Check for concurrent epoll_close */
+    /* --- Merge closing check with event processing under one lock ---
+     * This eliminates the TOCTOU window where epoll_close could free
+     * ep between the two previous lock acquisitions. */
     epoll_spinlock_lock(&ep->lock);
-    if (ep->closing) { epoll_spinlock_unlock(&ep->lock); return EPOLL_INVALID; }
-    epoll_spinlock_unlock(&ep->lock);
 
-    if (r > 0)
-    { // select 返回的是事件数量, 不是文件描述符的数量.
-      if (FD_ISSET(ep->pipes[0], &rset)) {
-        /**
-         * 这里需要处理以下情况：
-         * 1. 其它线程可能修改了`3`个集合内的`fd`，因此需要重新监听已注册的`fd`.
-         * 2. 如果`timeout > 0`则必须计算`select`调用过去了多久时间.
-         */
+    /* EINTR retry with timeout decay */
+    if (r < 0) {
+      if (errno == EINTR) {
+        epoll_spinlock_unlock(&ep->lock);
         if (timeout > 0) {
           timeout -= (uepoll_now() - wait_time);
           if (timeout < 0) timeout = 0;
         }
         continue;
       }
-      // printf("r = %d, nfds = %d\n", r, nfds);
-      /* 检查`fd`是否被设置 */
-      epoll_spinlock_lock(&ep->lock);
+      epoll_spinlock_unlock(&ep->lock);
+      break;
+    }
+
+    if (ep->closing) { epoll_spinlock_unlock(&ep->lock); return EPOLL_INVALID; }
+
+    if (r > 0)
+    {
+      if (FD_ISSET(ep->pipes[0], &rset)) {
+        if (timeout > 0) {
+          timeout -= (uepoll_now() - wait_time);
+          if (timeout < 0) timeout = 0;
+        }
+        epoll_spinlock_unlock(&ep->lock);
+        continue;
+      }
+
       for (SOCKET fd = 0; fd < nfds; fd++)
       {
         if (uepoll_has_fd(ep, fd))
@@ -514,7 +545,6 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
           if (ev->events) {
             ev->data.ptr = ep->udata[fd].data.ptr;
-            /* 如果携带`EPOLLONESHOT`属性, 则每次都需要重新修改事件 */
             if (uepoll_has_oneshot(ep->udata[fd].events)) {
               FD_CLR(fd, &ep->rset);
               FD_CLR(fd, &ep->wset);
@@ -524,19 +554,17 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
               ep->udata[fd].data.ptr = NULL;
             }
             nevents = nevents + 1;
-            /* 最多只能返回`maxevents`个事件. */
             if (nevents == maxevents)
               break;
-            /* 所有事件已经处理完毕. */
             if (r <= 0)
               break;
           }
 
         }
       }
-      epoll_spinlock_unlock(&ep->lock);
       r = nevents;
     }
+    epoll_spinlock_unlock(&ep->lock);
     break;
   }
   // Done.
