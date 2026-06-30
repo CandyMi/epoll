@@ -17,6 +17,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/time.h>
 
@@ -224,7 +225,57 @@ static inline int64_t epoll_now_ms(void)
 }
 
 /* ==================================================================
- *  7.  EINTR / pipe-wake timeout decay helpers
+ *  7.  Shared input validation — replaces 3 × copy-paste across backends
+ *
+ *  Every POSIX backend (kepoll.c, pepoll.c, uepoll.c) validates the
+ *  same parameters at the start of each entry point.  These inline
+ *  functions eliminate that duplication: a new backend simply calls
+ *  them instead of writing the same 5-line guard blocks.
+ *
+ *  Each function returns 0 on success or EPOLL_INVALID (-1) with
+ *  errno set.  The caller returns EPOLL_INVALID on non-zero.
+ * ================================================================== */
+
+/* Validate an epoll handle and fd pair for epoll_ctl.
+ * Rejects efd <= 0 and fd < 0 with EBADF. */
+static inline int epoll_validate_ctl(HANDLE efd, int op, SOCKET fd,
+                                      struct epoll_event *event)
+{
+    if (efd <= 0 || fd < 0) { errno = EBADF; return -1; }
+    if (op != EPOLL_CTL_DEL && !event) { errno = EFAULT; return -1; }
+    return 0;
+}
+
+/* Validate epoll_wait parameters.
+ * Rejects efd <= 0 (EBADF), NULL events (EFAULT), maxevents <= 0 (EINVAL).
+ * Clamps maxevents to cap internally. */
+static inline int epoll_validate_wait(HANDLE efd, struct epoll_event *events,
+                                       int maxevents, int cap)
+{
+    if (efd <= 0) { errno = EBADF; return -1; }
+    if (!events)  { errno = EFAULT; return -1; }
+    if (maxevents <= 0) { errno = EINVAL; return -1; }
+    return 0;
+}
+
+/* Validate epoll_create size argument.
+ * size must be >= 0 (EINVAL on negative).  Ignored by the kernel. */
+static inline int epoll_validate_create(int size)
+{
+    if (size < 0) { errno = EINVAL; return -1; }
+    return 0;
+}
+
+/* Validate epoll_create1 flags argument.
+ * Only EPOLL_CLOEXEC or 0 are accepted (EINVAL otherwise). */
+static inline int epoll_validate_create1(int flags)
+{
+    if (flags && flags != EPOLL_CLOEXEC) { errno = EINVAL; return -1; }
+    return 0;
+}
+
+/* ==================================================================
+ *  8.  EINTR / pipe-wake timeout decay helpers
  *
  *  Shared by kepoll.c, pepoll.c, and uepoll.c.  Eliminates the
  *  3-way copy of the same elapsed-time calculation pattern.

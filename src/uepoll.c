@@ -58,6 +58,14 @@
 
 #define epoll_notice(ep)  { ep->edited = true; write((ep)->pipes[1], "x", 1); }
 
+/* Internal per-fd state — replaces the hacky _nouse field in public
+ * epoll_event struct.  Keeps internal bookkeeping out of the public API. */
+struct uepoll_entry {
+    uint32_t used;         /* 1 = slot in use, 0 = free */
+    uint32_t events;       /* registered EPOLL* event mask */
+    epoll_data_t data;     /* user data (full union, not just ptr) */
+};
+
 struct epoll_t
 {
   bool edited;
@@ -69,7 +77,7 @@ struct epoll_t
   fd_set rset;
   fd_set wset;
   fd_set eset;
-  epoll_event udata[EPOLL_MAX_EVENTS];
+  struct uepoll_entry udata[EPOLL_MAX_EVENTS];
 };
 
 static inline void epoll_receive(struct epoll_t *ep) {
@@ -111,7 +119,7 @@ bool uepoll_can_poll(SOCKET fd) {
 static inline
 bool uepoll_has_fd(struct epoll_t* ep, SOCKET fd)
 {
-  return ep->udata[fd]._nouse == 0;
+  return ep->udata[fd].used == 1;
 }
 
 static inline
@@ -158,7 +166,7 @@ int uepoll_add_locked(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
     return EPOLL_INVALID;
   }
 
-  ep->udata[fd]._nouse = 0;
+  ep->udata[fd].used   = 1;
   ep->udata[fd].events = EPOLLEMPTY;
   ep->udata[fd].data.ptr = NULL;
 
@@ -190,7 +198,7 @@ int uepoll_add_locked(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
   }
 
   if (uepoll_has_events(ep->udata[fd].events)) {
-    ep->udata[fd].data.ptr = ev->data.ptr;
+    ep->udata[fd].data = ev->data;
     uepoll_append_nfds(ep, fd);
     epoll_notice(ep);
   }
@@ -239,7 +247,7 @@ int uepoll_mod_locked(struct epoll_t* ep, int fd, struct epoll_event *ev)
     ep->udata[fd].events |= EPOLLONESHOT;
   }
 
-  ep->udata[fd].data.ptr = ev->data.ptr;
+  ep->udata[fd].data = ev->data;
   epoll_notice(ep);
   uepoll_append_nfds(ep, fd);
   return EPOLL_SUCCESS;
@@ -261,7 +269,7 @@ int uepoll_del_locked(struct epoll_t* ep, SOCKET fd)
   FD_CLR(fd, &ep->wset);
   FD_CLR(fd, &ep->eset);
 
-  ep->udata[fd]._nouse = 1;
+  ep->udata[fd].used   = 0;
   ep->udata[fd].events = EPOLLEMPTY;
   ep->udata[fd].data.ptr = NULL;
 
@@ -284,18 +292,10 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
   errno = 0;
 
-  if (efd <= 0 || fd < 0) {
-    errno = EBADF;
-    return EPOLL_INVALID;
-  }
+  if (epoll_validate_ctl(efd, op, fd, event)) return EPOLL_INVALID;
 
   if (fd < 0 || fd >= EPOLL_MAX_EVENTS) {
     errno = ENOSPC;
-    return EPOLL_INVALID;
-  }
-
-  if (op != EPOLL_CTL_DEL && !event) {
-    errno = EFAULT;
     return EPOLL_INVALID;
   }
 
@@ -304,10 +304,10 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
     return EPOLL_INVALID;
   }
 
-  /* Take lock FIRST — prevents the TOCTOU race where epoll_close
-   * could free ep between a pre-check and the internal lock acquisition
-   * in the backend functions.  Locked variants assume lock held. */
+  /* Hold a reference so concurrent epoll_close cannot free ep
+   * during any unlocked section — matching pepoll.c pattern. */
   struct epoll_t* ep = (struct epoll_t*)efd;
+  epoll_refcnt_inc(&ep->recnt);
   epoll_spinlock_lock(&ep->lock);
 
   int result;
@@ -320,6 +320,9 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
   }
 
   epoll_spinlock_unlock(&ep->lock);
+  if (epoll_refcnt_dec(&ep->recnt) == 0) {
+    epoll_free(ep);
+  }
   return result;
 }
 
@@ -358,19 +361,13 @@ int epoll_close(HANDLE efd)
 
 HANDLE epoll_create(int size)
 {
-  if (size < 0) {
-    errno = EINVAL;
-    return -1;
-  }
+  if (epoll_validate_create(size)) return -1;
   return epoll_create1(0);
 }
 
 HANDLE epoll_create1(int flags)
 {
-  if (flags && flags != EPOLL_CLOEXEC) {
-    errno = EINVAL;
-    return -1;
-  }
+  if (epoll_validate_create1(flags)) return -1;
   errno = 0;
   struct epoll_t *ep = (struct epoll_t *)epoll_malloc(sizeof(struct epoll_t));
   if (!ep) {
@@ -397,8 +394,8 @@ HANDLE epoll_create1(int flags)
   FD_ZERO(&ep->eset);
   epoll_spinlock_init(&ep->lock);
   epoll_refcnt_init(&ep->recnt, 1);
-  for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i]._nouse = 1; // mark all slots as unused
-  struct epoll_event ev; ev.data.ptr = 0; ev.events = EPOLLIN; ev._nouse =1;
+  for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i].used = 0; // mark all slots as free
+  struct epoll_event ev; ev.data.ptr = 0; ev.events = EPOLLIN;
   uepoll_add(ep, ep->pipes[0], &ev);
   return (HANDLE)ep;
 }
@@ -407,20 +404,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 {
   errno = 0;
 
-  if (efd <= 0) {
-    errno = EBADF; // epfd is not a valid file descriptor.
-    return EPOLL_INVALID;
-  }
-
-  if (!events) {
-    errno = EFAULT;
-    return EPOLL_INVALID;
-  }
-
-  if (maxevents <= 0) {
-    errno = EINVAL;
-    return EPOLL_INVALID;
-  }
+  if (epoll_validate_wait(efd, events, maxevents, EPOLL_MAX_EVENTS)) return EPOLL_INVALID;
 
   if (maxevents > EPOLL_MAX_EVENTS)
     maxevents = EPOLL_MAX_EVENTS;
@@ -515,14 +499,12 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
           }
 
           if (ev->events) {
-            ev->data.ptr = ep->udata[fd].data.ptr;
+            ev->data = ep->udata[fd].data;
             if (uepoll_has_oneshot(ep->udata[fd].events)) {
               FD_CLR(fd, &ep->rset);
               FD_CLR(fd, &ep->wset);
               FD_CLR(fd, &ep->eset);
-              ep->udata[fd]._nouse = 1;
               ep->udata[fd].events = EPOLLEMPTY;
-              ep->udata[fd].data.ptr = NULL;
             }
             nevents = nevents + 1;
             if (nevents == maxevents)

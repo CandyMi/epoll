@@ -454,15 +454,7 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 {
     errno = 0;
 
-    if (efd <= 0 || fd < 0) {
-        errno = EBADF;
-        return EPOLL_INVALID;
-    }
-
-    if (op != EPOLL_CTL_DEL && !event) {
-        errno = EFAULT;
-        return EPOLL_INVALID;
-    }
+    if (epoll_validate_ctl(efd, op, fd, event)) return EPOLL_INVALID;
 
     struct epoll_t *ep = (struct epoll_t *)efd;
 
@@ -578,19 +570,13 @@ int epoll_close(HANDLE efd)
 
 HANDLE epoll_create(int size)
 {
-    if (size < 0) {
-        errno = EINVAL;
-        return -1;
-    }
+    if (epoll_validate_create(size)) return -1;
     return epoll_create1(0);
 }
 
 HANDLE epoll_create1(int flags)
 {
-    if (flags && flags != EPOLL_CLOEXEC) {
-        errno = EINVAL;
-        return -1;
-    }
+    if (epoll_validate_create1(flags)) return -1;
     errno = 0;
 
     struct epoll_t *ep = (struct epoll_t *)epoll_malloc(sizeof(struct epoll_t));
@@ -652,20 +638,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
     errno = 0;
 
-    if (efd <= 0) {
-        errno = EBADF;
-        return EPOLL_INVALID;
-    }
-
-    if (!events) {
-        errno = EFAULT;
-        return EPOLL_INVALID;
-    }
-
-    if (maxevents <= 0) {
-        errno = EINVAL;
-        return EPOLL_INVALID;
-    }
+    if (epoll_validate_wait(efd, events, maxevents, EPOLL_MAX_EVENTS)) return EPOLL_INVALID;
 
     struct epoll_t *ep = (struct epoll_t *)efd;
 
