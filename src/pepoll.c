@@ -23,6 +23,7 @@
 */
 
 #include "uepoll.h"
+#include "epoll_internal.h"
 
 #ifndef _GNU_SOURCE
 # define _GNU_SOURCE
@@ -38,38 +39,8 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 
-/* ── Spinlock (3-level degrading, same as uepoll.c / kepoll.c) ────── */
+/* ── Backend-specific constants ────────────────────────────────────── */
 
-// #define EPOLL_NO_THREADS 1
-#if defined(EPOLL_NO_THREADS)
-  /* If single-threaded is assumed, no locking is needed. */
-  typedef int epoll_lock_t;
-  #define epoll_spinlock_init(lock)       ((void)lock)
-  #define epoll_spinlock_lock(lock)       ((void)lock)
-  #define epoll_spinlock_unlock(lock)     ((void)lock)
-#elif defined(EPOLL_USE_ATOMIC) || \
-  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
-  #include <stdatomic.h>
-  typedef atomic_flag epoll_lock_t;
-  #define epoll_spinlock_init(lock)       atomic_flag_clear_explicit((lock), memory_order_release)
-  #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set_explicit((lock), memory_order_acquire))
-  #define epoll_spinlock_unlock(lock)     atomic_flag_clear_explicit((lock), memory_order_release)
-#elif defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
-  typedef int epoll_lock_t;
-  #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
-  #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
-  #define epoll_spinlock_unlock(lock)     __sync_lock_release((lock))
-#else
-  #error "Hey! Why doesn't your compiler support atomic operations yet?"
-#endif
-
-/* ── Constants ─────────────────────────────────────────────────────── */
-
-#define EPOLL_INVALID     (-1)
-#define EPOLLEMPTY        (0)
 #define EPOLL_SUCCESS     (0)
 
 /* Initial & max capacity for the dynamic pollfd array.
@@ -89,18 +60,6 @@
 #ifndef EPOLL_INITIAL_CAP
   #define EPOLL_INITIAL_CAP 512
 #endif
-
-/* Round n up to the next power of two. */
-static inline size_t round_up_pow2(size_t n) {
-    if (n == 0) return 1;
-    n--;
-    n |= n >> 1; n |= n >> 2; n |= n >> 4;
-    n |= n >> 8; n |= n >> 16;
-#if SIZE_MAX > UINT32_MAX
-    n |= n >> 32;
-#endif
-    return n + 1;
-}
 
 /* Epoll → poll event mapping.
  *
@@ -137,30 +96,7 @@ static inline size_t round_up_pow2(size_t n) {
 
 #define PP_HAS_ONESHOT(ev)  ((ev) & EPOLLONESHOT)
 
-/* ── Monotonic clock (ms) ──────────────────────────────────────────── */
-/* Same 3-level degrade as uepoll.c.  Used to compute remaining timeout
- * after a pipe-wake / EINTR retry. */
-static inline int64_t ppoll_now_ms(void)
-{
-#if defined(CLOCK_MONOTONIC_COARSE)
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-#elif defined(CLOCK_MONOTONIC)
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-#else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec * 1000 + tv.tv_usec / 1000;
-#endif
-}
-
 /* ── Helpers ───────────────────────────────────────────────────────── */
-
-#define epoll_malloc(sz)    epoll_realloc(NULL, sz)
-#define epoll_free(ptr)     (void)epoll_realloc(ptr, 0)
 
 /* Validate that a file descriptor can be polled via poll(2).
  * poll(2) accepts sockets, pipes/FIFOs, character devices, and
@@ -222,10 +158,9 @@ struct epoll_t {
  * Each epoll_wait call needs its own local copy; using a shared buffer
  * in struct epoll_t would cause data races on concurrent epoll_wait.
  *
- * Use a stack buffer for small arrays (up to WO_STACK_NFDS) to avoid
+ * Use a stack buffer for small arrays (up to EPOLL_STACK_NFDS) to avoid
  * heap churn; fall back to epoll_malloc for larger sets.
  */
-#define WO_STACK_NFDS  256
 
 /* ── Allocator ─────────────────────────────────────────────────────── */
 
@@ -617,7 +552,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     /* ── Acquire working buffer ──
      *
      * Default (EPOLL_USE_SHARED_WORKBUF=0): per-call stack + heap.
-     *   Stack for ≤ WO_STACK_NFDS (zero alloc), heap fallback for
+     *   Stack for ≤ EPOLL_STACK_NFDS (zero alloc), heap fallback for
      *   larger sets.  Safe for concurrent epoll_wait on the same handle.
      *
      * Shared (EPOLL_USE_SHARED_WORKBUF=1): buffer lives on epoll_t;
@@ -627,10 +562,10 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     struct pollfd *working  = NULL;
     int64_t        poll_start = 0;
 #else
-    struct pollfd  wstack[WO_STACK_NFDS];
+    struct pollfd  wstack[EPOLL_STACK_NFDS];
     struct pollfd *working  = wstack;
     bool           heap     = false;
-    size_t         wcap     = WO_STACK_NFDS;
+    size_t         wcap     = EPOLL_STACK_NFDS;
     int64_t        poll_start = 0;
 #endif
 
@@ -681,7 +616,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
         /* ── Step 2: record start and call poll(2) ── */
         if (timeout > 0)
-            poll_start = ppoll_now_ms();
+            poll_start = epoll_now_ms();
 
         int r = poll(working, (nfds_t)nfds, timeout);
 
@@ -701,7 +636,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             /* EINTR is the only recoverable error — retry with decay. */
             if (errno == EINTR) {
                 if (timeout > 0) {
-                    int64_t elapsed = ppoll_now_ms() - poll_start;
+                    int64_t elapsed = epoll_now_ms() - poll_start;
                     if (elapsed > 0) {
                         timeout -= (int)elapsed;
                         if (timeout < 0) timeout = 0;
@@ -727,7 +662,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
              * Decay remaining timeout if applicable. */
             epoll_spinlock_unlock(&ep->lock);
             if (timeout > 0) {
-                int64_t elapsed = ppoll_now_ms() - poll_start;
+                int64_t elapsed = epoll_now_ms() - poll_start;
                 if (elapsed > 0) {
                     timeout -= (int)elapsed;
                     if (timeout < 0) timeout = 0;

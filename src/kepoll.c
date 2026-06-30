@@ -18,6 +18,7 @@
 */
 
 #include "uepoll.h"
+#include "epoll_internal.h"
 
 // #include <stdio.h>
 #include <string.h>
@@ -31,37 +32,11 @@
 #include <sys/time.h>
 #include <sys/event.h>
 
-/* Per-call kevent buffer: stack for ≤ 256 events, heap fallback for larger.
+/* Per-call kevent buffer size — from epoll_internal.h.
  * sizeof(struct kevent) ≈ 32 bytes on 64-bit, so stack cost ≈ 8 KB. */
-#define KE_STACK_NEVENTS 256
 
 // #define EPOLL_NO_THREADS 1
-#if defined(EPOLL_NO_THREADS)
-  /* 如果假设不会有多线程的情况, 则不需要任何逻辑保证线程安全 */
-  typedef int epoll_lock_t;
-  #define epoll_spinlock_init(lock)       ((void)lock)
-  #define epoll_spinlock_lock(lock)       ((void)lock)
-  #define epoll_spinlock_unlock(lock)     ((void)lock)
-#elif defined(EPOLL_USE_ATOMIC) || \
-  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
-  #include <stdatomic.h>
-  typedef atomic_flag epoll_lock_t;
-  #define epoll_spinlock_init(lock)       atomic_flag_clear_explicit((lock), memory_order_release)
-  #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set_explicit((lock), memory_order_acquire))
-  #define epoll_spinlock_unlock(lock)     atomic_flag_clear_explicit((lock), memory_order_release)
-#elif defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
-  typedef int epoll_lock_t;
-  #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
-  #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
-  #define epoll_spinlock_unlock(lock)     __sync_lock_release((lock))
-#else
-  #error "Hey! Why doesn't your compiler support atomic operations yet?"
-#endif
 
-#define EPOLL_INVALID (-1)
 #define EPOLLEMPTY (0)
 
 /* Per-wait max events cap (power of two).
@@ -75,21 +50,6 @@
 #ifndef EPOLL_INITIAL_CAP
   #define EPOLL_INITIAL_CAP 512
 #endif
-
-/* Round n up to the next power of two. */
-static inline size_t round_up_pow2(size_t n) {
-    if (n == 0) return 1;
-    n--;
-    n |= n >> 1; n |= n >> 2; n |= n >> 4;
-    n |= n >> 8; n |= n >> 16;
-#if SIZE_MAX > UINT32_MAX
-    n |= n >> 32;
-#endif
-    return n + 1;
-}
-
-#define epoll_malloc(sz)  epoll_realloc(NULL, sz)
-#define epoll_free(ptr)   (void)epoll_realloc(ptr, 0)
 #define epoll_op_in(op)   ((op) == ((op) & (EPOLL_CTL_ADD | EPOLL_CTL_MOD | EPOLL_CTL_DEL)))
 
 struct epoll_t
@@ -323,7 +283,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   /* ── Acquire kevent buffer ──
    *
    * Default (EPOLL_USE_SHARED_WORKBUF=0): per-call stack + heap.
-   *   Stack for ≤ KE_STACK_NEVENTS (zero alloc), heap fallback for
+   *   Stack for ≤ EPOLL_STACK_NFDS (zero alloc), heap fallback for
    *   larger sets.  Safe for concurrent epoll_wait on the same handle.
    *
    * Shared (EPOLL_USE_SHARED_WORKBUF=1): buffer lives on epoll_t;
@@ -345,10 +305,10 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   }
   struct kevent *kqevents = ep->kqevents;
 #else
-  struct kevent  kstack[KE_STACK_NEVENTS];
+  struct kevent  kstack[EPOLL_STACK_NFDS];
   struct kevent *kqevents = kstack;
   bool           heap     = false;
-  if (maxevents > KE_STACK_NEVENTS) {
+  if (maxevents > EPOLL_STACK_NFDS) {
     kqevents = (struct kevent *)epoll_malloc((size_t)maxevents * sizeof(struct kevent));
     if (!kqevents) { errno = ENOMEM; return EPOLL_INVALID; }
     heap = true;

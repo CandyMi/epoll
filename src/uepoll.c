@@ -30,6 +30,7 @@
 #endif
 
 #include "uepoll.h"
+#include "epoll_internal.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -47,50 +48,15 @@
   #define FD_COPY(f, t)  memcpy(t, f, sizeof(*f));
 #endif
 
-// #define EPOLL_NO_THREADS 1
-#if defined(EPOLL_NO_THREADS)
-  /* 如果假设不会有多线程的情况, 则不需要任何逻辑保证线程安全 */
-  typedef int epoll_lock_t;
-  #define epoll_spinlock_init(lock)       ((void)lock)
-  #define epoll_spinlock_lock(lock)       ((void)lock)
-  #define epoll_spinlock_unlock(lock)     ((void)lock)
-#elif defined(EPOLL_USE_ATOMIC) || \
-  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
-  #include <stdatomic.h>
-  typedef atomic_flag epoll_lock_t;
-  #define epoll_spinlock_init(lock)       atomic_flag_clear_explicit((lock), memory_order_release)
-  #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set_explicit((lock), memory_order_acquire))
-  #define epoll_spinlock_unlock(lock)     atomic_flag_clear_explicit((lock), memory_order_release)
-#elif  defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) || \
-       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) || \
-       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || \
-       defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
-  typedef int epoll_lock_t;
-  #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
-  #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
-  #define epoll_spinlock_unlock(lock)     __sync_lock_release((lock))
-#else
-  #error "Hey! Why doesn't your compiler support atomic operations yet?"
-#endif
-
 #define EPOLL_MAX_EVENTS FD_SETSIZE
 
-#define EPOLLEMPTY  (0) // 空事件
-
+#define EPOLLEMPTY  (0)
 #define EPOLL_SUCCESS  (0)
-#define EPOLL_INVALID  (-1)
 
 #define uepoll_has_events(e)    (e & (EPOLLIN | EPOLLOUT | EPOLLERR))
 #define uepoll_has_oneshot(e)   (e & EPOLLONESHOT)
 
-#define epoll_nonexec(fd)  fcntl(fd, F_SETFD, FD_CLOEXEC | fcntl(fd, F_GETFD))
-#define epoll_nonblock(fd) fcntl(fd, F_SETFL, O_NONBLOCK | fcntl(fd, F_GETFL))
-
 #define epoll_notice(ep)  { ep->edited = true; write((ep)->pipes[1], "x", 1); }
-
-
-#define epoll_malloc(sz)  epoll_realloc(NULL, sz)
-#define epoll_free(ptr)   (void)epoll_realloc(ptr, 0)
 
 struct epoll_t
 {
@@ -121,32 +87,12 @@ void epoll_allocator(epoll_realloc_t realloc_func)
 }
 
 static inline
-int64_t uepoll_now()
-{
-  /**
-   * 不同时间源的调用性能差异很大, 因此尽量使用最快的时间源获取时间.
-   */
-#if defined(CLOCK_MONOTONIC_COARSE)
-  struct timespec now;
-  clock_gettime(CLOCK_MONOTONIC_COARSE, &now);
-  return now.tv_sec * 1000 + now.tv_nsec / 1000000;
-#elif defined(CLOCK_REALTIME_COARSE)
-  struct timespec now;
-  clock_gettime(CLOCK_REALTIME_COARSE, &now);
-  return now.tv_sec * 1000 + now.tv_nsec / 1000000;
-#else
-  struct timeval now; gettimeofday(&now, NULL);
-  return now.tv_sec * 1000 + now.tv_usec / 1000;
-#endif
-}
-
-static inline
 struct timeval* uepoll_timeout2timeval(int timeout, struct timeval* tv, int64_t *now)
 {
   if (timeout >= 0) {
     tv->tv_sec = timeout / 1000;
     tv->tv_usec = (timeout % 1000) * 1000;
-    if (now) *now = uepoll_now();
+    if (now) *now = epoll_now_ms();
     return tv;
   }
   return NULL;
@@ -498,7 +444,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
       if (errno == EINTR) {
         epoll_spinlock_unlock(&ep->lock);
         if (timeout > 0) {
-          timeout -= (uepoll_now() - wait_time);
+          timeout -= (epoll_now_ms() - wait_time);
           if (timeout < 0) timeout = 0;
         }
         continue;
@@ -513,7 +459,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     {
       if (FD_ISSET(ep->pipes[0], &rset)) {
         if (timeout > 0) {
-          timeout -= (uepoll_now() - wait_time);
+          timeout -= (epoll_now_ms() - wait_time);
           if (timeout < 0) timeout = 0;
         }
         epoll_spinlock_unlock(&ep->lock);
