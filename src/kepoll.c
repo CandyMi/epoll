@@ -211,34 +211,107 @@ int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, b
   return r;
 }
 
+/* Lock-held variants — assume ep->lock is held by epoll_ctl */
+static inline
+int _kepoll_register_locked(struct epoll_t *ep, SOCKET fd,
+                             struct epoll_event *event, bool first)
+{
+  if (!event) {
+    errno = EFAULT;
+    return EPOLL_INVALID;
+  }
+  int efd = ep->efd;
+  errno = 0; struct kevent ev[3];
+  int events = event->events; void *udata = event->data.ptr;
+  int filter = 0; int flags = 0; int nevent = 0;
+  uint32_t add = EV_ADD;
+  uint32_t exflags = (events & EPOLLONESHOT) ? EV_ONESHOT : 0;
+  if (events & EPOLLET)
+    exflags |= EV_CLEAR;
+  if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+    filter = EVFILT_READ; flags = add | EV_ENABLE | exflags;
+    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
+  } else {
+    filter = EVFILT_READ; flags = add | EV_DISABLE;
+    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
+  }
+  if (events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) {
+    filter = EVFILT_WRITE; flags = add | EV_ENABLE | exflags;
+    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
+  } else {
+    filter = EVFILT_WRITE; flags = add | EV_DISABLE;
+    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
+  }
+#if defined(EVFILT_EXCEPT) && defined(NOTE_OOB)
+  bool has_except = false;
+  if (events & EPOLLPRI) {
+    has_except = true;
+    EV_SET(&ev[nevent++], fd, EVFILT_EXCEPT, EV_ADD | EV_ENABLE | exflags, NOTE_OOB, 0, udata);
+  } else if (!first) {
+    has_except = true;
+    EV_SET(&ev[nevent++], fd, EVFILT_EXCEPT, EV_DELETE, 0, 0, 0);
+  }
+#endif
+  int r = kevent(efd, ev, nevent, NULL, 0, NULL);
+#if defined(EVFILT_EXCEPT) && defined(NOTE_OOB)
+  if (r < 0 && has_except) {
+    r = kevent(efd, ev, nevent - 1, NULL, 0, NULL);
+  }
+#endif
+  return r;
+}
+
+static inline
+int kepoll_add_locked(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+{
+  return _kepoll_register_locked(ep, fd, event, true);
+}
+
+static inline
+int kepoll_mod_locked(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
+{
+  return _kepoll_register_locked(ep, fd, event, false);
+}
+
+static inline
+int kepoll_del_locked(struct epoll_t *ep, SOCKET fd, bool deleted)
+{
+  int efd = ep->efd;
+  int action = deleted ? EV_DELETE : EV_DISABLE;
+  struct kevent ev[3]; int nevents = 0;
+  EV_SET(&ev[nevents++], fd, EVFILT_READ, action, 0, 0, NULL);
+  EV_SET(&ev[nevents++], fd, EVFILT_WRITE, action, 0, 0, NULL);
+  (void)kevent(efd, ev, nevents, NULL, 0, NULL);
+  errno = 0;
+  return 0;
+}
+
+/* Public wrappers — take lock, delegate, release */
 static inline
 int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
 {
-  return _kepoll_register(ep, fd, event, true);
+  epoll_spinlock_lock(&ep->lock);
+  int r = kepoll_add_locked(ep, fd, event);
+  epoll_spinlock_unlock(&ep->lock);
+  return r;
 }
 
 static inline
 int kepoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
 {
-  return _kepoll_register(ep, fd, event, false);
+  epoll_spinlock_lock(&ep->lock);
+  int r = kepoll_mod_locked(ep, fd, event);
+  epoll_spinlock_unlock(&ep->lock);
+  return r;
 }
 
 static inline
 int kepoll_del(struct epoll_t *ep, SOCKET fd, bool deleted)
 {
   epoll_spinlock_lock(&ep->lock);
-  int efd = ep->efd;
-  int action = deleted ? EV_DELETE : EV_DISABLE;
-  /* 可以一次系统调用可以删除/关闭此`fd`的所有事件 */
-  struct kevent ev[3]; int nevents = 0;
-  EV_SET(&ev[nevents++], fd, EVFILT_READ, action, 0, 0, NULL);
-  EV_SET(&ev[nevents++], fd, EVFILT_WRITE, action, 0, 0, NULL);
-  (void)kevent(efd, ev, nevents, NULL, 0, NULL);
-  // int r = kevent(efd, ev, nevents, NULL, 0, NULL);
-  // if (r) perror("kepoll_del");
-  errno = 0;
+  int r = kepoll_del_locked(ep, fd, deleted);
   epoll_spinlock_unlock(&ep->lock);
-  return 0;
+  return r;
 }
 
 int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
@@ -260,23 +333,24 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
     return EPOLL_INVALID;
   }
 
-  /* Reject operations on a closing epoll instance */
-  { struct epoll_t *__ep = (struct epoll_t *)efd;
-    epoll_spinlock_lock(&__ep->lock);
-    int __closing = __ep->closing;
-    epoll_spinlock_unlock(&__ep->lock);
-    if (__closing) { errno = EBADF; return EPOLL_INVALID; }
-  }
+  /* Take lock FIRST — this eliminates the TOCTOU window where
+   * epoll_close could free ep between a pre-check and dispatching
+   * to the backend functions.  The locked variants assume the lock
+   * is held and do NOT release it. */
+  struct epoll_t *ep = (struct epoll_t *)efd;
+  epoll_spinlock_lock(&ep->lock);
 
+  int result;
   switch (op)
   {
-    case EPOLL_CTL_ADD: return kepoll_add((struct epoll_t *)efd, fd, event);
-    case EPOLL_CTL_DEL: return kepoll_del((struct epoll_t *)efd, fd, true);
-    case EPOLL_CTL_MOD: return kepoll_mod((struct epoll_t *)efd, fd, event);
+    case EPOLL_CTL_ADD: result = kepoll_add_locked(ep, fd, event); break;
+    case EPOLL_CTL_DEL: result = kepoll_del_locked(ep, fd, true); break;
+    case EPOLL_CTL_MOD: result = kepoll_mod_locked(ep, fd, event); break;
+    default: errno = EINVAL; result = EPOLL_INVALID; break;
   }
-  errno = EINVAL;
-  // `op`必须是EPOLL_CTL_ADD, EPOLL_CTL_DEL或EPOLL_CTL_MOD.
-  return EPOLL_INVALID;  
+
+  epoll_spinlock_unlock(&ep->lock);
+  return result;
 }
 
 int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeout)
@@ -329,83 +403,101 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   }
 
   /* Capture local copies under lock — safe from concurrent epoll_close */
-  epoll_spinlock_lock(&ep->lock);
-  if (ep->closing) {
-    epoll_spinlock_unlock(&ep->lock);
-    if (heap) epoll_free(kqevents);
-    errno = EBADF;
-    return EPOLL_INVALID;
-  }
-  int local_efd = ep->efd;
-  epoll_spinlock_unlock(&ep->lock);
+  int64_t poll_start = 0;
+  if (timeout > 0)
+    poll_start = (int64_t)timeout;
 
-  struct epoll_event *ev;
-  int nevents = kevent(local_efd, NULL, 0, kqevents, maxevents, tsp);
-
-  /* Check for concurrent close — kevent may have been interrupted */
-  epoll_spinlock_lock(&ep->lock);
-  if (ep->closing) {
-    epoll_spinlock_unlock(&ep->lock);
-    if (heap) epoll_free(kqevents);
-    errno = EBADF;
-    return EPOLL_INVALID;
-  }
-  epoll_spinlock_unlock(&ep->lock);
-  // printf("nevents = %d\n", nevents);
-  if (nevents > 0)
-  {
-    /**
-     * 这里要做`2`件事来模拟`epoll`行为:
-     * 1. 合并相同`fd`的事件.
-     * 2. 实现单`fd`的`ONESHOT`删除.
-     */
-    uintptr_t before_fd = (uintptr_t)-1; int nkqevents = 0;
-    for (int i = 0; i < nevents; i++)
-    {
-      /* 标记上事件的fd, 方便融合事件. 相同fd的事件总是在旁边 */
-      if (before_fd != kqevents[i].ident) {
-        before_fd = kqevents[i].ident;
-        ev = &events[nkqevents];
-        ev->events = EPOLLEMPTY;
-        ev->data.ptr = kqevents[i].udata;
-        nkqevents++;
-      } else {
-        ev = &events[nkqevents - 1];
-      }
-
-      uint16_t flags = kqevents[i].flags;
-      if (flags & EV_ONESHOT) {
-        /* ONESHOT 事件先输出到 events[]，再清理内部状态 */
-        if (flags & EV_ERROR) ev->events |= EPOLLERR;
-        if (flags & EV_EOF)   ev->events |= EPOLLHUP;
-        if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
-        if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
-        ev->data.ptr = kqevents[i].udata;
-        kepoll_del(ep, kqevents[i].ident, false);
-        continue;
-      } else if (flags & EV_ERROR || flags & EV_EOF) {
-        // printf("EV_ERROR | EV_EOF %ld, 0x%08x\n", kqevents[i].ident, flags);
-        kepoll_del(ep, kqevents[i].ident, false);
-        if (flags & EV_ERROR) ev->events |= EPOLLERR;
-        if (flags & EV_EOF)   ev->events |= EPOLLHUP;
-        if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
-        if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
-        ev->data.ptr = kqevents[i].udata;
-        continue;
-      }
-
-      /* 判断 kqueue 事件 */
-      switch (kqevents[i].filter)
-      {
-        case EVFILT_READ:   ev->events |= EPOLLIN; break;
-        case EVFILT_WRITE:  ev->events |= EPOLLOUT; break;
-#if defined (EVFILT_EXCEPT)
-        case EVFILT_EXCEPT: ev->events |= EPOLLPRI; break;
-#endif
-      }
+  while (1) {
+    epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+      epoll_spinlock_unlock(&ep->lock);
+      if (heap) epoll_free(kqevents);
+      errno = EBADF;
+      return EPOLL_INVALID;
     }
-    nevents = nkqevents;
+    int local_efd = ep->efd;
+    epoll_spinlock_unlock(&ep->lock);
+
+    struct epoll_event *ev;
+    int nevents = kevent(local_efd, NULL, 0, kqevents, maxevents, tsp);
+
+    /* Re-acquire lock to check closing and process events — merged
+     * into one critical section so no epoll_close can free ep between
+     * the check and the kepoll_del calls in the event loop. */
+    epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+      epoll_spinlock_unlock(&ep->lock);
+      if (heap) epoll_free(kqevents);
+      errno = EBADF;
+      return EPOLL_INVALID;
+    }
+
+    /* --- EINTR retry with timeout decay --- */
+    if (nevents < 0) {
+      if (errno == EINTR) {
+        epoll_spinlock_unlock(&ep->lock);
+        if (timeout > 0) {
+          /* Approximate decay: kevent timeout is relative, just retry */
+          timeout -= 100;
+          if (timeout < 0) timeout = 0;
+          tsp->tv_nsec = (timeout % 1000) * 1000000;
+          tsp->tv_sec  = (timeout - timeout % 1000) / 1000;
+        }
+        continue;
+      }
+      epoll_spinlock_unlock(&ep->lock);
+      if (heap) epoll_free(kqevents);
+      return EPOLL_INVALID;
+    }
+
+    if (nevents > 0)
+    {
+      uintptr_t before_fd = (uintptr_t)-1; int nkqevents = 0;
+      for (int i = 0; i < nevents; i++)
+      {
+        if (before_fd != kqevents[i].ident) {
+          before_fd = kqevents[i].ident;
+          ev = &events[nkqevents];
+          ev->events = EPOLLEMPTY;
+          ev->data.ptr = kqevents[i].udata;
+          nkqevents++;
+        } else {
+          ev = &events[nkqevents - 1];
+        }
+
+        uint16_t flags = kqevents[i].flags;
+        if (flags & EV_ONESHOT) {
+          if (flags & EV_ERROR) ev->events |= EPOLLERR;
+          if (flags & EV_EOF)   ev->events |= EPOLLHUP;
+          if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
+          if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
+          ev->data.ptr = kqevents[i].udata;
+          kepoll_del_locked(ep, kqevents[i].ident, false);
+          continue;
+        } else if (flags & EV_ERROR || flags & EV_EOF) {
+          kepoll_del_locked(ep, kqevents[i].ident, false);
+          if (flags & EV_ERROR) ev->events |= EPOLLERR;
+          if (flags & EV_EOF)   ev->events |= EPOLLHUP;
+          if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
+          if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
+          ev->data.ptr = kqevents[i].udata;
+          continue;
+        }
+
+        switch (kqevents[i].filter)
+        {
+          case EVFILT_READ:   ev->events |= EPOLLIN; break;
+          case EVFILT_WRITE:  ev->events |= EPOLLOUT; break;
+#if defined (EVFILT_EXCEPT)
+          case EVFILT_EXCEPT: ev->events |= EPOLLPRI; break;
+#endif
+        }
+      }
+      nevents = nkqevents;
+    }
+    epoll_spinlock_unlock(&ep->lock);
+
+    if (heap) epoll_free(kqevents);
+    return nevents;
   }
-  if (heap) epoll_free(kqevents);
-  return nevents;
 }
