@@ -286,7 +286,6 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   struct kevent  kstack[EPOLL_STACK_NFDS];
   struct kevent *kqevents = kstack;
   bool           heap     = false;
-  int64_t        wait_start = 0;
   if (maxevents > EPOLL_STACK_NFDS) {
     kqevents = (struct kevent *)epoll_malloc((size_t)maxevents * sizeof(struct kevent));
     if (!kqevents) { errno = ENOMEM; return EPOLL_INVALID; }
@@ -294,6 +293,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   }
 #endif
 
+  int64_t        wait_start = 0;
   int    result = EPOLL_INVALID;
 
   /* ── Acquire a reference ──
