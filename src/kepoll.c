@@ -57,6 +57,7 @@ struct epoll_t
   int efd;
   epoll_lock_t lock;
   volatile int closing;         /* 1 = epoll_close in progress */
+  epoll_refcnt_t recnt;         /* reference count (safe close/wait) */
 #if EPOLL_USE_SHARED_WORKBUF
   struct kevent *kqevents;      /* shared kevent buffer (2^n heap, lazy) */
   size_t         kqcap;         /* current kqevents capacity */
@@ -93,10 +94,13 @@ int epoll_close(HANDLE efd)
   if (saved_efd > 0)
     close(saved_efd);
 
+  /* drop our reference; last one cleans up */
+  if (epoll_refcnt_dec(&ep->recnt) == 0) {
 #if EPOLL_USE_SHARED_WORKBUF
-  epoll_free(ep->kqevents);
+    epoll_free(ep->kqevents);
 #endif
-  epoll_free(ep);
+    epoll_free(ep);
+  }
   return 0;
 }
 
@@ -130,6 +134,7 @@ HANDLE epoll_create1(int flags)
   memset(ep, 0, sizeof(struct epoll_t));
   ep->efd = efd;
   epoll_spinlock_init(&ep->lock);
+  epoll_refcnt_init(&ep->recnt, 1);
   return (HANDLE)ep;
 }
 
@@ -316,16 +321,30 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   }
 #endif
 
-  /* Capture local copies under lock — safe from concurrent epoll_close */
+  int    result = EPOLL_INVALID;
+
+  /* ── Acquire a reference ──
+   *  Hold one refcount across the entire wait so epoll_close cannot
+   *  free ep while we are blocked in kevent() or looping on EINTR. */
+  epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+#if !EPOLL_USE_SHARED_WORKBUF
+    if (heap) epoll_free(kqevents);
+#endif
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
+  epoll_refcnt_inc(&ep->recnt);
+  epoll_spinlock_unlock(&ep->lock);
+
   while (1) {
     epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {
       epoll_spinlock_unlock(&ep->lock);
-#if !EPOLL_USE_SHARED_WORKBUF
-      if (heap) epoll_free(kqevents);
-#endif
       errno = EBADF;
-      return EPOLL_INVALID;
+      result = EPOLL_INVALID;
+      goto done;
     }
     int local_efd = ep->efd;
     epoll_spinlock_unlock(&ep->lock);
@@ -340,11 +359,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {
       epoll_spinlock_unlock(&ep->lock);
-#if !EPOLL_USE_SHARED_WORKBUF
-      if (heap) epoll_free(kqevents);
-#endif
       errno = EBADF;
-      return EPOLL_INVALID;
+      result = EPOLL_INVALID;
+      goto done;
     }
 
     /* --- EINTR retry with timeout decay --- */
@@ -359,10 +376,8 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         continue;
       }
       epoll_spinlock_unlock(&ep->lock);
-#if !EPOLL_USE_SHARED_WORKBUF
-      if (heap) epoll_free(kqevents);
-#endif
-      return EPOLL_INVALID;
+      result = EPOLL_INVALID;
+      goto done;
     }
 
     if (nevents > 0)
@@ -412,9 +427,19 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     }
     epoll_spinlock_unlock(&ep->lock);
 
-#if !EPOLL_USE_SHARED_WORKBUF
-    if (heap) epoll_free(kqevents);
-#endif
-    return nevents;
+    result = nevents;
+    goto done;
   }
+
+done:
+#if !EPOLL_USE_SHARED_WORKBUF
+  if (heap) epoll_free(kqevents);
+#endif
+  if (epoll_refcnt_dec(&ep->recnt) == 0) {
+#if EPOLL_USE_SHARED_WORKBUF
+    epoll_free(ep->kqevents);
+#endif
+    epoll_free(ep);
+  }
+  return result;
 }

@@ -148,6 +148,47 @@
 #endif
 
 /* ==================================================================
+ *  5.5  Reference count (atomic, 3-level degrading)
+ *
+ *  Shared by kepoll.c, pepoll.c, uepoll.c for safe concurrent
+ *  epoll_close / epoll_wait.  Prevents use-after-free by deferring
+ *  struct epoll_t deallocation until the last reference is dropped.
+ *
+ *  Detection mirrors the spinlock (section 5 above): C11 <stdatomic.h>
+ *  is preferred; GCC __sync_* builtins are the fallback.
+ *
+ *  epoll_refcnt_inc(r)  — return NEW value (post-increment)
+ *  epoll_refcnt_dec(r)  — return NEW value (post-decrement)
+ *  Rationale: checking "== 0" after dec reads naturally as "is zero".
+ * ================================================================== */
+
+#if defined(EPOLL_USE_ATOMIC) || \
+  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
+  /* C11 <stdatomic.h> — included above by the spinlock section. */
+  typedef atomic_int epoll_refcnt_t;
+  #define epoll_refcnt_init(r, v)  atomic_init(r, v)
+  #define epoll_refcnt_inc(r)      (atomic_fetch_add(r, 1) + 1)
+  #define epoll_refcnt_dec(r)      (atomic_fetch_sub(r, 1) - 1)
+
+#elif defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || \
+      defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
+  /* GCC legacy __sync_* builtins (pre-C11 compilers). */
+  typedef int epoll_refcnt_t;
+  #define epoll_refcnt_init(r, v)  ((void)(*(r) = (v)))
+  #define epoll_refcnt_inc(r)      __sync_add_and_fetch(r, 1)
+  #define epoll_refcnt_dec(r)      __sync_sub_and_fetch(r, 1)
+
+#elif defined(EPOLL_NO_THREADS)
+  /* Single-threaded: plain volatile int. */
+  typedef volatile int epoll_refcnt_t;
+  #define epoll_refcnt_init(r, v)  ((void)(*(r) = (v)))
+  #define epoll_refcnt_inc(r)      (++*(r))
+  #define epoll_refcnt_dec(r)      (--*(r))
+#else
+  #error "epoll internal: no atomic operations available for refcount."
+#endif
+
+/* ==================================================================
  *  6.  Monotonic clock — current time in milliseconds
  *
  *  Backends need a monotonic (or at least non-decreasing) time source

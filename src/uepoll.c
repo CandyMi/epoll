@@ -65,6 +65,7 @@ struct epoll_t
   int pipes[2];
   epoll_lock_t lock;
   volatile int closing;
+  epoll_refcnt_t recnt;         /* reference count (safe close/wait) */
   fd_set rset;
   fd_set wset;
   fd_set eset;
@@ -338,13 +339,20 @@ int epoll_close(HANDLE efd)
     return EPOLL_INVALID;
   }
   ep->closing = 1;
+  /* Save pipe fds and close after unlock */
+  int p0 = ep->pipes[0], p1 = ep->pipes[1];
+  ep->pipes[0] = ep->pipes[1] = -1;
   /* Wake any select() blocked in epoll_wait */
-  write(ep->pipes[1], "x", 1);
+  write(p1, "x", 1);
   epoll_spinlock_unlock(&ep->lock);
 
-  close(ep->pipes[0]); ep->pipes[0] = -1;
-  close(ep->pipes[1]); ep->pipes[1] = -1;
-  epoll_free(ep);
+  close(p0);
+  close(p1);
+
+  /* drop our reference; last one cleans up */
+  if (epoll_refcnt_dec(&ep->recnt) == 0) {
+    epoll_free(ep);
+  }
   return EPOLL_SUCCESS;
 }
 
@@ -388,6 +396,7 @@ HANDLE epoll_create1(int flags)
   FD_ZERO(&ep->wset);
   FD_ZERO(&ep->eset);
   epoll_spinlock_init(&ep->lock);
+  epoll_refcnt_init(&ep->recnt, 1);
   for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i]._nouse = 1; // 表示未使用fd.
   struct epoll_event ev; ev.data.ptr = 0; ev.events = EPOLLIN; ev._nouse =1;
   uepoll_add(ep, ep->pipes[0], &ev);
@@ -416,8 +425,21 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   if (maxevents > EPOLL_MAX_EVENTS)
     maxevents = EPOLL_MAX_EVENTS;
 
-  int r;
   struct epoll_t* ep = (struct epoll_t*)efd;
+  int result = EPOLL_INVALID;
+
+  /* ── Acquire a reference ──
+   *  Hold one refcount across the entire wait so epoll_close cannot
+   *  free ep while we are blocked in select() or looping on EINTR. */
+  epoll_spinlock_lock(&ep->lock);
+  if (ep->closing) {
+    epoll_spinlock_unlock(&ep->lock);
+    errno = EBADF;
+    return EPOLL_INVALID;
+  }
+  epoll_refcnt_inc(&ep->recnt);
+  epoll_spinlock_unlock(&ep->lock);
+
   while (1)
   {
     struct timeval ts = {0, 0}; int64_t wait_time;
@@ -432,7 +454,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     epoll_spinlock_unlock(&ep->lock);
 
     int nevents = 0; struct epoll_event* ev;
-    r = select(nfds, &rset, &wset, &eset, tp);
+    int r = select(nfds, &rset, &wset, &eset, tp);
 
     /* --- Merge closing check with event processing under one lock ---
      * This eliminates the TOCTOU window where epoll_close could free
@@ -447,10 +469,15 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         continue;
       }
       epoll_spinlock_unlock(&ep->lock);
-      break;
+      result = EPOLL_INVALID;
+      goto done;
     }
 
-    if (ep->closing) { epoll_spinlock_unlock(&ep->lock); return EPOLL_INVALID; }
+    if (ep->closing) {
+      epoll_spinlock_unlock(&ep->lock);
+      result = EPOLL_INVALID;
+      goto done;
+    }
 
     if (r > 0)
     {
@@ -508,8 +535,14 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
       r = nevents;
     }
     epoll_spinlock_unlock(&ep->lock);
-    break;
+
+    result = r;
+    goto done;
   }
-  // Done.
-  return r;
+
+done:
+  if (epoll_refcnt_dec(&ep->recnt) == 0) {
+    epoll_free(ep);
+  }
+  return result;
 }

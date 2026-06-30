@@ -128,6 +128,7 @@ struct epoll_t {
     int               pipes[2];     /* self-waking pipe (write to wake, read to drain) */
     epoll_lock_t      lock;
     volatile int      closing;      /* 1 = epoll_close in progress */
+    epoll_refcnt_t    recnt;        /* reference count (safe close/wait) */
 
     int               capacity;     /* allocated size of arrays */
     int               nfds;         /* number of active entries (including pipe slot 0) */
@@ -441,20 +442,25 @@ int epoll_close(HANDLE efd)
         return EPOLL_INVALID;
     }
     ep->closing = 1;
+    /* Save pipe fds and close after unlock */
+    int p0 = ep->pipes[0], p1 = ep->pipes[1];
+    ep->pipes[0] = ep->pipes[1] = -1;
     /* Wake any poll() blocked in epoll_wait */
-    write(ep->pipes[1], "x", 1);
+    write(p1, "x", 1);
     epoll_spinlock_unlock(&ep->lock);
 
-    close(ep->pipes[0]); ep->pipes[0] = -1;
-    close(ep->pipes[1]); ep->pipes[1] = -1;
+    close(p0);
+    close(p1);
 
-    epoll_free(ep->entries);   ep->entries  = NULL;
-    epoll_free(ep->pollfds);   ep->pollfds  = NULL;
+    /* drop our reference; last one cleans up */
+    if (epoll_refcnt_dec(&ep->recnt) == 0) {
+        epoll_free(ep->entries);
+        epoll_free(ep->pollfds);
 #if EPOLL_USE_SHARED_WORKBUF
-    epoll_free(ep->working);
+        epoll_free(ep->working);
 #endif
-    epoll_free(ep);
-
+        epoll_free(ep);
+    }
     return EPOLL_SUCCESS;
 }
 
@@ -524,6 +530,7 @@ HANDLE epoll_create1(int flags)
     ep->nfds = 1;
     ep->edited = false;
     epoll_spinlock_init(&ep->lock);
+    epoll_refcnt_init(&ep->recnt, 1);
 
     return (HANDLE)ep;
 }
@@ -569,6 +576,23 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     int64_t        poll_start = 0;
 #endif
 
+    int result = EPOLL_INVALID;
+
+    /* ── Acquire a reference ──
+     *  Hold one refcount across the entire wait so epoll_close cannot
+     *  free ep while we are blocked in poll() or looping on EINTR. */
+    epoll_spinlock_lock(&ep->lock);
+    if (ep->closing) {
+        epoll_spinlock_unlock(&ep->lock);
+#if !EPOLL_USE_SHARED_WORKBUF
+        if (heap) epoll_free(working);
+#endif
+        errno = EBADF;
+        return EPOLL_INVALID;
+    }
+    epoll_refcnt_inc(&ep->recnt);
+    epoll_spinlock_unlock(&ep->lock);
+
     while (1)
     {
         /* ── Step 1: drain wake pipe and snapshot pollfds under lock ── */
@@ -587,7 +611,8 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             if (!p) {
                 epoll_spinlock_unlock(&ep->lock);
                 errno = ENOMEM;
-                goto out;
+                result = EPOLL_INVALID;
+                goto done;
             }
             ep->working = p;
             ep->wcap    = newcap;
@@ -605,7 +630,8 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             if (!working) {
                 epoll_spinlock_unlock(&ep->lock);
                 errno = ENOMEM;
-                goto out;
+                result = EPOLL_INVALID;
+                goto done;
             }
             wcap = (size_t)nfds;
         }
@@ -624,11 +650,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         epoll_spinlock_lock(&ep->lock);
         if (ep->closing) {
             epoll_spinlock_unlock(&ep->lock);
-#if !EPOLL_USE_SHARED_WORKBUF
-            if (heap) { epoll_free(working); heap = false; }
-#endif
             errno = EBADF;
-            return EPOLL_INVALID;
+            result = EPOLL_INVALID;
+            goto done;
         }
 
         if (r < 0) {
@@ -638,16 +662,15 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
                 epoll_timeout_decay(&timeout, poll_start);
                 continue;
             }
-            goto out;
+            result = EPOLL_INVALID;
+            goto done;
         }
 
         if (r == 0) {
             epoll_spinlock_unlock(&ep->lock);
             /* Timeout with no events */
-#if !EPOLL_USE_SHARED_WORKBUF
-            if (heap) { epoll_free(working); heap = false; working = wstack; }
-#endif
-            return 0;
+            result = 0;
+            goto done;
         }
 
         /* ── Step 3: check for pipe wake ── */
@@ -701,15 +724,21 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         }
         epoll_spinlock_unlock(&ep->lock);
 
-#if !EPOLL_USE_SHARED_WORKBUF
-        if (heap) epoll_free(working);
-#endif
-        return nevents;
+        result = nevents;
+        goto done;
     }
 
-out:
+done:
 #if !EPOLL_USE_SHARED_WORKBUF
-    if (heap) epoll_free(working);
+    if (heap) { epoll_free(working); heap = false; working = wstack; }
 #endif
-    return EPOLL_INVALID;
+    if (epoll_refcnt_dec(&ep->recnt) == 0) {
+        epoll_free(ep->entries);
+        epoll_free(ep->pollfds);
+#if EPOLL_USE_SHARED_WORKBUF
+        epoll_free(ep->working);
+#endif
+        epoll_free(ep);
+    }
+    return result;
 }
