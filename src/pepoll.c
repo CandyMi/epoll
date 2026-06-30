@@ -43,14 +43,12 @@
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
   /* If single-threaded is assumed, no locking is needed. */
-  #define ppoll_use_spinlock -1
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       ((void)lock)
   #define epoll_spinlock_lock(lock)       ((void)lock)
   #define epoll_spinlock_unlock(lock)     ((void)lock)
 #elif defined(EPOLL_USE_ATOMIC) || \
   (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
-  #define ppoll_use_spinlock 1
   #include <stdatomic.h>
   typedef atomic_flag epoll_lock_t;
   #define epoll_spinlock_init(lock)       atomic_flag_clear_explicit((lock), memory_order_release)
@@ -60,7 +58,6 @@
    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) \
    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) \
    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
-  #define ppoll_use_spinlock 2
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
   #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
@@ -452,30 +449,6 @@ static inline int ppoll_del_locked(struct epoll_t *ep, SOCKET fd)
 
 /* Public wrappers — each takes lock, delegates to locked variant,
  * releases lock.  Kept for any direct callers within the file. */
-static inline int ppoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
-{
-    epoll_spinlock_lock(&ep->lock);
-    int r = ppoll_add_locked(ep, fd, event);
-    epoll_spinlock_unlock(&ep->lock);
-    return r;
-}
-
-static inline int ppoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
-{
-    epoll_spinlock_lock(&ep->lock);
-    int r = ppoll_mod_locked(ep, fd, event);
-    epoll_spinlock_unlock(&ep->lock);
-    return r;
-}
-
-static inline int ppoll_del(struct epoll_t *ep, SOCKET fd)
-{
-    epoll_spinlock_lock(&ep->lock);
-    int r = ppoll_del_locked(ep, fd);
-    epoll_spinlock_unlock(&ep->lock);
-    return r;
-}
-
 /* ── Public API ────────────────────────────────────────────────────── */
 
 int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)

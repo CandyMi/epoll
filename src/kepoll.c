@@ -173,70 +173,6 @@ HANDLE epoll_create1(int flags)
   return (HANDLE)ep;
 }
 
-static inline
-int _kepoll_register(struct epoll_t *ep, SOCKET fd, struct epoll_event *event, bool first)
-{
-  if (!event) {
-    errno = EFAULT;
-    return EPOLL_INVALID;
-  }
-  epoll_spinlock_lock(&ep->lock);
-  int efd = ep->efd;
-  errno = 0; struct kevent ev[3];
-  /* 一次性事件 */
-  int events = event->events; void *udata = event->data.ptr;
-  /* 虽然添加, 但是可以不启用 */
-  int filter = 0; int flags = 0; int nevent = 0; 
-  // kqueue 的 EV_ADD 是 upsert 语义：不存在则添加，存在则更新。
-  // ADD 和 MOD 都统一使用 EV_ADD，确保 MOD 能正确更新 udata / flags。
-  uint32_t add = EV_ADD;
-  uint32_t exflags = (events & EPOLLONESHOT) ? EV_ONESHOT : 0;
-  if (events & EPOLLET) // 模拟`ET`模式
-    exflags |= EV_CLEAR;
-  // printf("events & EPOLLET = 0x%08x, flags = 0x%04x\n", events & EPOLLET, exflags);
-  /* 读事件 — 只有读相关事件（含 EPOLLERR/EPOLLHUP/EPOLLRDHUP）才启用 EVFILT_READ。
-   * 注意这不同于 Linux epoll 始终监听 EPOLLERR/EPOLLHUP 的语义；但 kqueue 上
-   * 连接断开也会通过 EVFILT_WRITE 的 EV_EOF/EV_ERROR 上报，所以纯写场景不漏。 */
-  if (events & (EPOLLIN | EPOLLRDNORM | EPOLLRDBAND | EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
-    filter = EVFILT_READ; flags = add | EV_ENABLE | exflags;
-    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
-  } else {
-    filter = EVFILT_READ; flags = add | EV_DISABLE;
-    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
-  }
-  /* 写事件 */
-  if (events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND)) {
-    filter = EVFILT_WRITE; flags = add | EV_ENABLE | exflags;
-    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
-  } else {
-    filter = EVFILT_WRITE; flags = add | EV_DISABLE;
-    EV_SET(&ev[nevent++], fd, filter, flags, 0, 0, udata);
-  }
-  /* 异常/带外事件 → EVFILT_EXCEPT (NOTE_OOB) — 与 READ/WRITE 合入同一次 kevent，
-   * 减少系统调用。pipe 等 fd 不支持 EVFILT_EXCEPT（错误码因平台而异），
-   * 回退去掉 EXCEPT 条目重试。 */
-#if defined(EVFILT_EXCEPT) && defined(NOTE_OOB)
-  bool has_except = false;
-  if (events & EPOLLPRI) {
-    has_except = true;
-    EV_SET(&ev[nevent++], fd, EVFILT_EXCEPT, EV_ADD | EV_ENABLE | exflags, NOTE_OOB, 0, udata);
-  } else if (!first) {
-    has_except = true;
-    EV_SET(&ev[nevent++], fd, EVFILT_EXCEPT, EV_DELETE, 0, 0, 0);
-  }
-#endif
-  /* 一次提交所有事件 — 最多 3 个 (READ + WRITE + EXCEPT) */
-  int r = kevent(efd, ev, nevent, NULL, 0, NULL);
-#if defined(EVFILT_EXCEPT) && defined(NOTE_OOB)
-  if (r < 0 && has_except) {
-    /* pipe 不支持 EVFILT_EXCEPT — 去掉最后一条重试 */
-    r = kevent(efd, ev, nevent - 1, NULL, 0, NULL);
-  }
-#endif
-  epoll_spinlock_unlock(&ep->lock);
-  return r;
-}
-
 /* Lock-held variants — assume ep->lock is held by epoll_ctl */
 static inline
 int _kepoll_register_locked(struct epoll_t *ep, SOCKET fd,
@@ -310,34 +246,6 @@ int kepoll_del_locked(struct epoll_t *ep, SOCKET fd, bool deleted)
   (void)kevent(efd, ev, nevents, NULL, 0, NULL);
   errno = 0;
   return 0;
-}
-
-/* Public wrappers — take lock, delegate, release */
-static inline
-int kepoll_add(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
-{
-  epoll_spinlock_lock(&ep->lock);
-  int r = kepoll_add_locked(ep, fd, event);
-  epoll_spinlock_unlock(&ep->lock);
-  return r;
-}
-
-static inline
-int kepoll_mod(struct epoll_t *ep, SOCKET fd, struct epoll_event *event)
-{
-  epoll_spinlock_lock(&ep->lock);
-  int r = kepoll_mod_locked(ep, fd, event);
-  epoll_spinlock_unlock(&ep->lock);
-  return r;
-}
-
-static inline
-int kepoll_del(struct epoll_t *ep, SOCKET fd, bool deleted)
-{
-  epoll_spinlock_lock(&ep->lock);
-  int r = kepoll_del_locked(ep, fd, deleted);
-  epoll_spinlock_unlock(&ep->lock);
-  return r;
 }
 
 int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
@@ -448,10 +356,6 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 #endif
 
   /* Capture local copies under lock — safe from concurrent epoll_close */
-  int64_t poll_start = 0;
-  if (timeout > 0)
-    poll_start = (int64_t)timeout;
-
   while (1) {
     epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {

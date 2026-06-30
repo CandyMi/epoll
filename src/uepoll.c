@@ -50,14 +50,12 @@
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
   /* 如果假设不会有多线程的情况, 则不需要任何逻辑保证线程安全 */
-  #define uepoll_use_spinlock -1
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       ((void)lock)
   #define epoll_spinlock_lock(lock)       ((void)lock)
   #define epoll_spinlock_unlock(lock)     ((void)lock)
 #elif defined(EPOLL_USE_ATOMIC) || \
   (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
-  #define uepoll_use_spinlock 1
   #include <stdatomic.h>
   typedef atomic_flag epoll_lock_t;
   #define epoll_spinlock_init(lock)       atomic_flag_clear_explicit((lock), memory_order_release)
@@ -67,7 +65,6 @@
        defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) || \
        defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) || \
        defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
-  #define uepoll_use_spinlock 2
   typedef int epoll_lock_t;
   #define epoll_spinlock_init(lock)       __sync_lock_test_and_set((lock), 0)
   #define epoll_spinlock_lock(lock)       do { __sync_synchronize(); } while (__sync_lock_test_and_set((lock), 1) == 1)
@@ -332,24 +329,6 @@ int uepoll_add(struct epoll_t* ep, SOCKET fd, struct epoll_event* ev)
 {
   epoll_spinlock_lock(&ep->lock);
   int r = uepoll_add_locked(ep, fd, ev);
-  epoll_spinlock_unlock(&ep->lock);
-  return r;
-}
-
-static inline 
-int uepoll_mod(struct epoll_t* ep, int fd, struct epoll_event *ev)
-{
-  epoll_spinlock_lock(&ep->lock);
-  int r = uepoll_mod_locked(ep, fd, ev);
-  epoll_spinlock_unlock(&ep->lock);
-  return r;
-}
-
-static inline
-int uepoll_del(struct epoll_t* ep, SOCKET fd)
-{
-  epoll_spinlock_lock(&ep->lock);
-  int r = uepoll_del_locked(ep, fd);
   epoll_spinlock_unlock(&ep->lock);
   return r;
 }
