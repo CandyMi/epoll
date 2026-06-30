@@ -1741,6 +1741,86 @@ int sock_update(port_state_t* port_state, sock_state_t* sock_state) {
     sock_state->poll_info.Handles[0].Events =
         sock__epoll_events_to_afd_events(sock_state->user_events);
 
+    /*
+     * AFD polls are edge-triggered — they only complete on state
+     * transitions. For a socket that is already in the desired state
+     * (e.g., a connected TCP socket registered with EPOLLOUT while
+     * already writable), the AFD poll never completes, causing
+     * epoll_wait to hang indefinitely.
+     *
+     * Workaround: do a zero-timeout select() probe to check the
+     * current socket state before committing to the edge-triggered
+     * AFD poll. If any requested events are already satisfied,
+     * inject a synthetic IOCP completion via PostQueuedCompletionStatus
+     * to report them immediately. The normal sock_feed_event/requeue
+     * cycle then handles ongoing monitoring via a real AFD poll.
+     */
+    {
+      uint32_t probe_events =
+          sock_state->user_events & (EPOLLIN | EPOLLOUT | EPOLLRDNORM |
+                                     EPOLLWRNORM | EPOLLWRBAND);
+      if (probe_events != 0) {
+        struct timeval tv = {0, 0};
+        fd_set readfds, writefds;
+        SOCKET s = sock_state->base_socket;
+        int select_result;
+
+        FD_ZERO(&readfds);
+        FD_ZERO(&writefds);
+
+        if (probe_events & (EPOLLIN | EPOLLRDNORM))
+          FD_SET(s, &readfds);
+        if (probe_events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND))
+          FD_SET(s, &writefds);
+
+        select_result = select(0,
+                               (probe_events & (EPOLLIN | EPOLLRDNORM))
+                                   ? &readfds
+                                   : NULL,
+                               (probe_events & (EPOLLOUT | EPOLLWRNORM |
+                                                EPOLLWRBAND))
+                                   ? &writefds
+                                   : NULL,
+                               NULL,
+                               &tv);
+
+        if (select_result > 0) {
+          DWORD afd_events = 0;
+
+          if (FD_ISSET(s, &readfds))
+            afd_events |= AFD_POLL_RECEIVE | AFD_POLL_ACCEPT;
+          if (FD_ISSET(s, &writefds))
+            afd_events |= AFD_POLL_SEND;
+
+          if (afd_events != 0) {
+            /*
+             * Socket is already in the desired state.  Don't start
+             * the edge-triggered AFD poll — inject a synthetic
+             * completion into the IOCP instead.
+             */
+            sock_state->poll_info.NumberOfHandles = 1;
+            sock_state->poll_info.Handles[0].Events = afd_events;
+            sock_state->io_status_block.Status = STATUS_SUCCESS;
+            sock_state->io_status_block.Information = 0;
+
+            if (!PostQueuedCompletionStatus(
+                    port_get_iocp_handle(port_state),
+                    0,
+                    0,
+                    (LPOVERLAPPED)
+                        &sock_state->io_status_block)) {
+              return_map_error(-1);
+            }
+
+            /* Stay idle; sock_feed_event will handle the completion
+             * and requeue this socket for a real AFD poll. */
+            port_cancel_socket_update(port_state, sock_state);
+            return 0;
+          }
+        }
+      }
+    }
+
     if (afd_poll(poll_group_get_afd_device_handle(sock_state->poll_group),
                  &sock_state->poll_info,
                  &sock_state->io_status_block) < 0) {
