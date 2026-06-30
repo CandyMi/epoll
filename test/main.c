@@ -327,6 +327,7 @@ EPOLL_TEST_FUNCTION(testcase_epoll_hup_flag, {
     close(RPIPE); epoll_close(efd);
 })
 
+#if !defined(EPOLL_BACKEND_SELECT)
 EPOLL_TEST_FUNCTION(testcase_epoll_hup_register_err, {
     /*
      * Verify that registering with EPOLLERR only (no EPOLLIN/OUT)
@@ -351,6 +352,7 @@ EPOLL_TEST_FUNCTION(testcase_epoll_hup_register_err, {
     }
     close(RPIPE); epoll_close(efd);
 })
+#endif /* !EPOLL_BACKEND_SELECT */
 
 EPOLL_TEST_FUNCTION(testcase_epoll_infinite, {
     HANDLE efd = epoll_create(1);
@@ -730,8 +732,10 @@ int main(int argc, char const *argv[])
     testcase_epoll_watch();
     testcase_epoll_repeat();
     testcase_epoll_oneshot();
-#if !defined(EPOLL_BACKEND_POLL) && !defined(EPOLL_BACKEND_SELECT) && (defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__))
-    testcase_epoll_et_mode();  /* kqueue (BSD/Darwin) supports ET via EV_CLEAR; poll/select are always LT */
+#if !defined(EPOLL_BACKEND_POLL) && !defined(EPOLL_BACKEND_SELECT)
+    /* EPOLLET is supported by kernel epoll (Linux) and kqueue (BSD/Darwin via EV_CLEAR).
+     * poll(2) and select(2) are always level-triggered and skip this test. */
+    testcase_epoll_et_mode();
 #endif
     testcase_epoll_ctl_del();
     testcase_epoll_ctl_mod();
@@ -740,7 +744,10 @@ int main(int argc, char const *argv[])
     testcase_epoll_ctl_error();
     testcase_epoll_hup();
     testcase_epoll_hup_flag();
+#if !defined(EPOLL_BACKEND_SELECT)
+    /* select(2) cannot detect EPOLLHUP — EOF is reported as EPOLLIN. */
     testcase_epoll_hup_register_err();
+#endif
     testcase_epoll_infinite();
     testcase_epoll_data_ptr();
     testcase_epoll_create1_flag();
