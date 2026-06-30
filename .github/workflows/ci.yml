@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/uepoll.c test/main.c -o build/select_main
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -DEPOLL_BACKEND_SELECT=1 -I include/epoll src/uepoll.c test/main.c -o build/select_main
       - run: ./build/select_main
 
   linux-pepoll:
@@ -39,16 +39,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o build/poll_main
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -DEPOLL_BACKEND_POLL=1 -I include/epoll src/pepoll.c test/main.c -o build/poll_main
       - run: ./build/poll_main
 
-  # ── macOS ─────────────────────────────────────
-  macos-clang:
-    name: "macOS · Clang · kqueue"
+  # ── macOS (pepoll — default) ─────────────────
+  macos-pepoll:
+    name: "macOS · Clang · poll (pepoll)"
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - run: cmake -S . -B build
+      - run: cmake --build build
+      - run: ./build/main
+
+  # ── macOS (kqueue — EPFD_POLL=OFF) ────────────
+  macos-kqueue:
+    name: "macOS · Clang · kqueue (kepoll)"
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DEPFD_POLL=OFF
       - run: cmake --build build
       - run: ./build/main
 
@@ -95,17 +105,28 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o build/asan_poll_main -fsanitize=address -g -O1 -fno-omit-frame-pointer
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -DEPOLL_BACKEND_POLL=1 -I include/epoll src/pepoll.c test/main.c -o build/asan_poll_main -fsanitize=address -g -O1 -fno-omit-frame-pointer
       - run: timeout 120 ./build/asan_poll_main
 
-  # ── ASAN: macOS (kqueue) ──────────────────────
-  macos-asan-kqueue:
-    name: "macOS · Clang · ASAN · kqueue"
+  # ── ASAN: macOS (pepoll) ─────────────────────
+  macos-asan-pepoll:
+    name: "macOS · Clang · ASAN · poll (pepoll)"
     timeout-minutes: 5
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - run: cmake -S . -B build -DCMAKE_C_COMPILER=clang -DENABLE_ASAN=ON
+      - run: cmake --build build
+      - run: ./build/main
+
+  # ── ASAN: macOS (kqueue) ──────────────────────
+  macos-asan-kqueue:
+    name: "macOS · Clang · ASAN · kqueue (kepoll)"
+    timeout-minutes: 5
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_C_COMPILER=clang -DEPFD_POLL=OFF -DENABLE_ASAN=ON
       - run: cmake --build build
       - run: ./build/main
 
@@ -115,7 +136,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o build/tsan_poll_main -fsanitize=thread -g -O1 -fno-omit-frame-pointer -lpthread
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -DEPOLL_BACKEND_POLL=1 -I include/epoll src/pepoll.c test/main.c -o build/tsan_poll_main -fsanitize=thread -g -O1 -fno-omit-frame-pointer -lpthread
       - run: ./build/tsan_poll_main
 
   windows-mingw:

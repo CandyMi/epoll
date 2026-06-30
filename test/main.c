@@ -732,9 +732,12 @@ int main(int argc, char const *argv[])
     testcase_epoll_watch();
     testcase_epoll_repeat();
     testcase_epoll_oneshot();
-#if !defined(EPOLL_BACKEND_POLL) && !defined(EPOLL_BACKEND_SELECT)
-    /* EPOLLET is supported by kernel epoll (Linux) and kqueue (BSD/Darwin via EV_CLEAR).
-     * poll(2) and select(2) are always level-triggered and skip this test. */
+#if !defined(EPOLL_BACKEND_POLL) && !defined(EPOLL_BACKEND_SELECT) \
+    && (defined(EPOLL_BACKEND_KERNEL) || defined(__APPLE__) || defined(__FreeBSD__) \
+        || defined(__NetBSD__) || defined(__OpenBSD__) || defined(__DragonFly__))
+    /* EPOLLET: supported by kernel epoll (Linux) and kqueue (BSD/Darwin via EV_CLEAR).
+     * poll(2) and select(2) are always level-triggered.  The EPOLL_BACKEND_KERNEL check
+     * ensures this also works for manual gcc compiles of native epoll. */
     testcase_epoll_et_mode();
 #endif
     testcase_epoll_ctl_del();
