@@ -76,9 +76,34 @@
 #define EPOLL_SUCCESS     (0)
 
 /* Initial & max capacity for the dynamic pollfd array.
- * Slot 0 is reserved for the self-waking pipe read end. */
+ * Slot 0 is reserved for the self-waking pipe read end.
+ * PP_MAX_CAPACITY controls max REGISTERED fds (epoll_ctl ADD),
+ * NOT per-wait event count — that is EPOLL_MAX_EVENTS below. */
 #define PP_INITIAL_CAPACITY   64
 #define PP_MAX_CAPACITY       (256 * 1024)
+
+/* Per-wait max events cap (power of two).
+ * epoll_wait returns at most this many events per call. */
+#ifndef EPOLL_MAX_EVENTS
+  #define EPOLL_MAX_EVENTS 65536
+#endif
+
+/* Initial capacity for the shared working buffer (if EPOLL_USE_SHARED_WORKBUF=1). */
+#ifndef EPOLL_INITIAL_CAP
+  #define EPOLL_INITIAL_CAP 512
+#endif
+
+/* Round n up to the next power of two. */
+static inline size_t round_up_pow2(size_t n) {
+    if (n == 0) return 1;
+    n--;
+    n |= n >> 1; n |= n >> 2; n |= n >> 4;
+    n |= n >> 8; n |= n >> 16;
+#if SIZE_MAX > UINT32_MAX
+    n |= n >> 32;
+#endif
+    return n + 1;
+}
 
 /* Epoll → poll event mapping.
  *
@@ -188,6 +213,11 @@ struct epoll_t {
      * next-index for free slots, there's no extra memory cost.
      */
     int               free_head;
+
+#if EPOLL_USE_SHARED_WORKBUF
+    struct pollfd    *working;      /* shared pollfd working buffer (2^n heap, lazy) */
+    size_t            wcap;         /* current working capacity */
+#endif
 };
 
 /*
@@ -512,6 +542,9 @@ int epoll_close(HANDLE efd)
 
     epoll_free(ep->entries);   ep->entries  = NULL;
     epoll_free(ep->pollfds);   ep->pollfds  = NULL;
+#if EPOLL_USE_SHARED_WORKBUF
+    epoll_free(ep->working);
+#endif
     epoll_free(ep);
 
     return EPOLL_SUCCESS;
@@ -608,17 +641,25 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
     struct epoll_t *ep = (struct epoll_t *)efd;
 
-    /* poll(2) uses milliseconds directly — no timeval conversion needed.
+    /* ── Acquire working buffer ──
      *
-     * Working buffer is declared once outside the loop and reused across
-     * retries (pipe wake / EINTR).  It starts on the stack (≤ 256 fds)
-     * and transparently upgrades to the heap via (re)alloc on demand —
-     * no repeated alloc/free in the retry path. */
+     * Default (EPOLL_USE_SHARED_WORKBUF=0): per-call stack + heap.
+     *   Stack for ≤ WO_STACK_NFDS (zero alloc), heap fallback for
+     *   larger sets.  Safe for concurrent epoll_wait on the same handle.
+     *
+     * Shared (EPOLL_USE_SHARED_WORKBUF=1): buffer lives on epoll_t;
+     *   realloc when nfds exceeds current capacity.  NOT safe for
+     *   concurrent epoll_wait on the same handle (undefined behavior). */
+#if EPOLL_USE_SHARED_WORKBUF
+    struct pollfd *working  = NULL;
+    int64_t        poll_start = 0;
+#else
     struct pollfd  wstack[WO_STACK_NFDS];
     struct pollfd *working  = wstack;
     bool           heap     = false;
     size_t         wcap     = WO_STACK_NFDS;
     int64_t        poll_start = 0;
+#endif
 
     while (1)
     {
@@ -629,6 +670,22 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
         /* Grow working buffer on demand — only when nfds exceeds current
          * capacity.  Never shrinks, so retry loops pay zero alloc cost. */
+#if EPOLL_USE_SHARED_WORKBUF
+        if ((size_t)nfds > ep->wcap) {
+            size_t newcap = round_up_pow2((size_t)nfds);
+            if (newcap < EPOLL_INITIAL_CAP) newcap = EPOLL_INITIAL_CAP;
+            struct pollfd *p = (struct pollfd *)epoll_realloc(ep->working,
+                                    newcap * sizeof(struct pollfd));
+            if (!p) {
+                epoll_spinlock_unlock(&ep->lock);
+                errno = ENOMEM;
+                goto out;
+            }
+            ep->working = p;
+            ep->wcap    = newcap;
+        }
+        working = ep->working;
+#else
         if ((size_t)nfds > wcap) {
             size_t new_sz = (size_t)nfds * sizeof(struct pollfd);
             if (!heap) {
@@ -644,6 +701,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             }
             wcap = (size_t)nfds;
         }
+#endif
 
         memcpy(working, ep->pollfds, (size_t)nfds * sizeof(struct pollfd));
         epoll_spinlock_unlock(&ep->lock);
@@ -658,7 +716,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         epoll_spinlock_lock(&ep->lock);
         if (ep->closing) {
             epoll_spinlock_unlock(&ep->lock);
+#if !EPOLL_USE_SHARED_WORKBUF
             if (heap) { epoll_free(working); heap = false; }
+#endif
             errno = EBADF;
             return EPOLL_INVALID;
         }
@@ -682,7 +742,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         if (r == 0) {
             epoll_spinlock_unlock(&ep->lock);
             /* Timeout with no events */
+#if !EPOLL_USE_SHARED_WORKBUF
             if (heap) { epoll_free(working); heap = false; working = wstack; }
+#endif
             return 0;
         }
 
@@ -743,11 +805,15 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         }
         epoll_spinlock_unlock(&ep->lock);
 
+#if !EPOLL_USE_SHARED_WORKBUF
         if (heap) epoll_free(working);
+#endif
         return nevents;
     }
 
 out:
+#if !EPOLL_USE_SHARED_WORKBUF
     if (heap) epoll_free(working);
+#endif
     return EPOLL_INVALID;
 }

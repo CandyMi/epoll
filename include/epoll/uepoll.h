@@ -24,6 +24,20 @@
     #define NO_NATIVE_EPOLL 1
 #endif
 
+/* Working buffer strategy for kepoll.c / pepoll.c:
+ *
+ *   0 (default) — per-call stack + heap fallback.
+ *       Thread-safe: multiple threads may epoll_wait the same handle.
+ *       Stack for ≤ 256 events (zero alloc), heap otherwise.
+ *
+ *   1 — shared buffer on struct epoll_t, lazy 2^n realloc.
+ *       NOT thread-safe for concurrent epoll_wait on the same handle.
+ *       Zero alloc after initial growth (amortized).  Set via compiler flag.
+ */
+#ifndef EPOLL_USE_SHARED_WORKBUF
+    #define EPOLL_USE_SHARED_WORKBUF 0
+#endif
+
 #ifndef FD_SETSIZE
     #define FD_SETSIZE 1024
 #endif

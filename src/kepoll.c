@@ -64,9 +64,29 @@
 #define EPOLL_INVALID (-1)
 #define EPOLLEMPTY (0)
 
+/* Per-wait max events cap (power of two).
+ * epoll_wait returns at most this many events per call. */
 #ifndef EPOLL_MAX_EVENTS
-  #define EPOLL_MAX_EVENTS 4096
+  #define EPOLL_MAX_EVENTS 65536
 #endif
+
+/* Initial capacity for the shared working buffer (if EPOLL_USE_SHARED_WORKBUF=1).
+ * Grows by 2^n from here up to EPOLL_MAX_EVENTS. */
+#ifndef EPOLL_INITIAL_CAP
+  #define EPOLL_INITIAL_CAP 512
+#endif
+
+/* Round n up to the next power of two. */
+static inline size_t round_up_pow2(size_t n) {
+    if (n == 0) return 1;
+    n--;
+    n |= n >> 1; n |= n >> 2; n |= n >> 4;
+    n |= n >> 8; n |= n >> 16;
+#if SIZE_MAX > UINT32_MAX
+    n |= n >> 32;
+#endif
+    return n + 1;
+}
 
 #define epoll_malloc(sz)  epoll_realloc(NULL, sz)
 #define epoll_free(ptr)   (void)epoll_realloc(ptr, 0)
@@ -77,7 +97,10 @@ struct epoll_t
   int efd;
   epoll_lock_t lock;
   volatile int closing;         /* 1 = epoll_close in progress */
-  /* No shared kevent buffer — epoll_wait uses per-call stack or heap */
+#if EPOLL_USE_SHARED_WORKBUF
+  struct kevent *kqevents;      /* shared kevent buffer (2^n heap, lazy) */
+  size_t         kqcap;         /* current kqevents capacity */
+#endif
 };
 
 static epoll_realloc_t epoll_realloc = realloc;
@@ -110,6 +133,9 @@ int epoll_close(HANDLE efd)
   if (saved_efd > 0)
     close(saved_efd);
 
+#if EPOLL_USE_SHARED_WORKBUF
+  epoll_free(ep->kqevents);
+#endif
   epoll_free(ep);
   return 0;
 }
@@ -386,21 +412,40 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
   struct epoll_t *ep = (struct epoll_t *)efd;
 
-  /* Per-call kevent buffer — each thread gets its own, no shared state.
-   * Stack for small sets (≤ KE_STACK_NEVENTS), heap otherwise.
-   * This makes concurrent epoll_wait safe (unlike a shared buffer). */
+  /* ── Acquire kevent buffer ──
+   *
+   * Default (EPOLL_USE_SHARED_WORKBUF=0): per-call stack + heap.
+   *   Stack for ≤ KE_STACK_NEVENTS (zero alloc), heap fallback for
+   *   larger sets.  Safe for concurrent epoll_wait on the same handle.
+   *
+   * Shared (EPOLL_USE_SHARED_WORKBUF=1): buffer lives on epoll_t;
+   *   realloc when maxevents exceeds current capacity.  NOT safe for
+   *   concurrent epoll_wait on the same handle (undefined behavior). */
+#if EPOLL_USE_SHARED_WORKBUF
+  if (maxevents > (int)ep->kqcap) {
+    size_t newcap = (size_t)maxevents;
+    if (newcap > EPOLL_MAX_EVENTS) newcap = EPOLL_MAX_EVENTS;
+    newcap = round_up_pow2(newcap);
+    if (newcap < EPOLL_INITIAL_CAP) newcap = EPOLL_INITIAL_CAP;
+    if (newcap > ep->kqcap) {
+      struct kevent *p = (struct kevent *)epoll_realloc(ep->kqevents,
+                              newcap * sizeof(struct kevent));
+      if (!p) { errno = ENOMEM; return EPOLL_INVALID; }
+      ep->kqevents = p;
+      ep->kqcap    = newcap;
+    }
+  }
+  struct kevent *kqevents = ep->kqevents;
+#else
   struct kevent  kstack[KE_STACK_NEVENTS];
   struct kevent *kqevents = kstack;
   bool           heap     = false;
-
   if (maxevents > KE_STACK_NEVENTS) {
     kqevents = (struct kevent *)epoll_malloc((size_t)maxevents * sizeof(struct kevent));
-    if (!kqevents) {
-      errno = ENOMEM;
-      return EPOLL_INVALID;
-    }
+    if (!kqevents) { errno = ENOMEM; return EPOLL_INVALID; }
     heap = true;
   }
+#endif
 
   /* Capture local copies under lock — safe from concurrent epoll_close */
   int64_t poll_start = 0;
@@ -411,7 +456,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {
       epoll_spinlock_unlock(&ep->lock);
+#if !EPOLL_USE_SHARED_WORKBUF
       if (heap) epoll_free(kqevents);
+#endif
       errno = EBADF;
       return EPOLL_INVALID;
     }
@@ -427,7 +474,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     epoll_spinlock_lock(&ep->lock);
     if (ep->closing) {
       epoll_spinlock_unlock(&ep->lock);
+#if !EPOLL_USE_SHARED_WORKBUF
       if (heap) epoll_free(kqevents);
+#endif
       errno = EBADF;
       return EPOLL_INVALID;
     }
@@ -446,7 +495,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
         continue;
       }
       epoll_spinlock_unlock(&ep->lock);
+#if !EPOLL_USE_SHARED_WORKBUF
       if (heap) epoll_free(kqevents);
+#endif
       return EPOLL_INVALID;
     }
 
@@ -497,7 +548,9 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     }
     epoll_spinlock_unlock(&ep->lock);
 
+#if !EPOLL_USE_SHARED_WORKBUF
     if (heap) epoll_free(kqevents);
+#endif
     return nevents;
   }
 }
