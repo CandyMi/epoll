@@ -462,7 +462,7 @@ struct concurrent_ctx {
 
 static void* concurrent_writer(void *arg) {
     struct concurrent_ctx *ctx = (struct concurrent_ctx *)arg;
-    ctx->started = 1;
+    __atomic_store_n(&ctx->started, 1, __ATOMIC_RELEASE);
     /* small delay so main thread enters epoll_wait first */
     struct timespec ts = {0, 5000000};  /* 5 ms */
     nanosleep(&ts, NULL);
@@ -492,7 +492,7 @@ EPOLL_TEST_FUNCTION(testcase_epoll_concurrent, {
     assert(r == 0);
 
     /* Wait for thread to confirm it started */
-    while (!ctx.started) {}
+    while (!__atomic_load_n(&ctx.started, __ATOMIC_ACQUIRE)) {}
 
     /* Block in epoll_wait — the writer thread will wake us up */
     struct epoll_event event[1];
@@ -503,6 +503,193 @@ EPOLL_TEST_FUNCTION(testcase_epoll_concurrent, {
 
     pthread_join(thr, NULL);
     close(WPIPE); close(RPIPE); epoll_close(efd);
+})
+
+/* ── Concurrent: multi-writer stress ────────────────────────────── */
+
+#define CONCUR_NFDS 8
+
+struct writer_job {
+    int write_fd;
+    volatile int *ready;
+};
+
+static void* concur_writer_single(void *arg) {
+    struct writer_job *job = (struct writer_job *)arg;
+    while (!__atomic_load_n(job->ready, __ATOMIC_ACQUIRE)) {}       /* spin until main thread signals */
+    write(job->write_fd, "!", 1);
+    return NULL;
+}
+
+EPOLL_TEST_FUNCTION(testcase_epoll_concurrent_multi, {
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+    int nfds = CONCUR_NFDS;
+    int pipes[CONCUR_NFDS][2];
+    struct writer_job jobs[CONCUR_NFDS];
+    pthread_t writers[CONCUR_NFDS];
+    volatile int go = 0;
+
+    for (int i = 0; i < nfds; i++) {
+        int r = pipe(pipes[i]);
+        assert(r == 0);
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = pipes[i][0];
+        r = epoll_ctl(efd, EPOLL_CTL_ADD, pipes[i][0], &ev);
+        assert(r == 0);
+        jobs[i].write_fd = pipes[i][1];
+        jobs[i].ready = &go;
+    }
+
+    for (int i = 0; i < nfds; i++)
+        pthread_create(&writers[i], NULL, concur_writer_single, &jobs[i]);
+
+    __atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+
+    struct epoll_event events[CONCUR_NFDS * 2];
+    int seen[CONCUR_NFDS] = {0};
+    int total = 0;
+    while (total < nfds) {
+        int r = epoll_wait(efd, events, CONCUR_NFDS * 2, 5000);
+        assert(r > 0);
+        for (int i = 0; i < r && total < nfds; i++) {
+            int fd = events[i].data.fd;
+            for (int j = 0; j < nfds; j++) {
+                if (pipes[j][0] == fd && !seen[j]) {
+                    seen[j] = 1;
+                    total++;
+                    break;
+                }
+            }
+        }
+    }
+
+    for (int i = 0; i < nfds; i++) {
+        pthread_join(writers[i], NULL);
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+    epoll_close(efd);
+
+    for (int i = 0; i < nfds; i++)
+        assert(seen[i] == 1);
+})
+
+#if !defined(EPOLL_BACKEND_KERNEL)
+/* ── Concurrent: epoll_close races with epoll_wait(∞) ─────────── */
+
+struct close_race_ctx {
+    HANDLE efd;
+    volatile int started;
+};
+
+static void* close_race_closer(void *arg) {
+    struct close_race_ctx *ctx = (struct close_race_ctx *)arg;
+    while (!__atomic_load_n(&ctx->started, __ATOMIC_ACQUIRE)) {}
+    /* small delay so the waiter enters epoll_wait first */
+    struct timespec ts = {0, 10000000}; /* 10 ms */
+    nanosleep(&ts, NULL);
+    epoll_close(ctx->efd);
+    return NULL;
+}
+EPOLL_TEST_FUNCTION(testcase_epoll_concurrent_close_race, {
+    int fds[2];
+    int r = pipe(fds);
+    assert(r == 0);
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+
+    struct epoll_event ev;
+    ev.events = EPOLLIN;
+    ev.data.fd = fds[0];
+    r = epoll_ctl(efd, EPOLL_CTL_ADD, fds[0], &ev);
+    assert(r == 0);
+
+    struct close_race_ctx ctx;
+    ctx.efd = efd;
+    ctx.started = 0;
+
+    pthread_t thr;
+    r = pthread_create(&thr, NULL, close_race_closer, &ctx);
+    assert(r == 0);
+
+    __atomic_store_n(&ctx.started, 1, __ATOMIC_RELEASE);
+
+    /* Block in epoll_wait — the closer thread should interrupt us */
+    struct epoll_event event[1];
+    r = epoll_wait(efd, event, 1, -1);
+    assert(r == -1);
+    assert(errno == EBADF);
+
+    pthread_join(thr, NULL);
+    close(fds[0]);
+    close(fds[1]);
+})
+#endif /* !EPOLL_BACKEND_KERNEL */
+
+/* ── Concurrent: epoll_ctl ADD/MOD/DEL from multiple threads ──── */
+
+struct ctl_stress_job {
+    HANDLE efd;
+    int pipe_fd;
+    int iterations;
+    volatile int *ready;
+};
+
+static void* ctl_stress_worker(void *arg) {
+    struct ctl_stress_job *job = (struct ctl_stress_job *)arg;
+    while (!__atomic_load_n(job->ready, __ATOMIC_ACQUIRE)) {}
+    for (int i = 0; i < job->iterations; i++) {
+        struct epoll_event ev;
+        ev.events = EPOLLIN;
+        ev.data.fd = job->pipe_fd;
+        int r = epoll_ctl(job->efd, EPOLL_CTL_ADD, job->pipe_fd, &ev);
+        if (r == 0) {
+            /* MOD the event mask — toggle EPOLLONESHOT each time */
+            ev.events = EPOLLIN | (i & 1 ? EPOLLONESHOT : 0);
+            epoll_ctl(job->efd, EPOLL_CTL_MOD, job->pipe_fd, &ev);
+            epoll_ctl(job->efd, EPOLL_CTL_DEL, job->pipe_fd, NULL);
+        }
+        /* r != 0 is acceptable (race with another thread's DEL) */
+    }
+    return NULL;
+}
+
+EPOLL_TEST_FUNCTION(testcase_epoll_concurrent_ctl_stress, {
+    int nthreads = 4;
+    int iterations = 200;
+    HANDLE efd = epoll_create(1);
+    assert(efd > 0);
+
+    pthread_t threads[nthreads];
+    struct ctl_stress_job jobs[nthreads];
+    volatile int go = 0;
+
+    for (int i = 0; i < nthreads; i++) {
+        int fds[2];
+        int r = pipe(fds);
+        assert(r == 0);
+        jobs[i].efd = efd;
+        jobs[i].pipe_fd = fds[0];  /* read end */
+        jobs[i].iterations = iterations;
+        jobs[i].ready = &go;
+        /* Keep the write end open — close it after the test */
+        pthread_create(&threads[i], NULL, ctl_stress_worker, &jobs[i]);
+    }
+
+    __atomic_store_n(&go, 1, __ATOMIC_RELEASE);
+
+    for (int i = 0; i < nthreads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    /* Clean up remaining pipe fds — we don't know which are still registered */
+    epoll_close(efd);
+    /* Close the write ends (we lost track of read fds — they're in jobs[i].pipe_fd) */
+    for (int i = 0; i < nthreads; i++) {
+        close(jobs[i].pipe_fd);
+    }
 })
 
 #endif /* !WIN32 */
@@ -560,6 +747,11 @@ int main(int argc, char const *argv[])
     testcase_epoll_merge();
     testcase_epoll_pri();
     testcase_epoll_concurrent();
+    testcase_epoll_concurrent_multi();
+#if !defined(EPOLL_BACKEND_KERNEL)
+    testcase_epoll_concurrent_close_race();
+#endif
+    testcase_epoll_concurrent_ctl_stress();
 #endif
     return 0;
 }

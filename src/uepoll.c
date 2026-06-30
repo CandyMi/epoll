@@ -339,18 +339,18 @@ int epoll_close(HANDLE efd)
     return EPOLL_INVALID;
   }
   ep->closing = 1;
-  /* Save pipe fds and close after unlock */
-  int p0 = ep->pipes[0], p1 = ep->pipes[1];
-  ep->pipes[0] = ep->pipes[1] = -1;
-  /* Wake any select() blocked in epoll_wait */
-  write(p1, "x", 1);
+  /* Wake any select() blocked in epoll_wait.  Do NOT close the pipe
+   * fds here — on macOS, close() of a pipe fd while select() is
+   * monitoring it does NOT wake select() when other valid fds exist.
+   * The pipe is left open so the "x" signal remains readable;
+   * it is closed when refcnt reaches 0 below. */
+  write(ep->pipes[1], "x", 1);
   epoll_spinlock_unlock(&ep->lock);
-
-  close(p0);
-  close(p1);
 
   /* drop our reference; last one cleans up */
   if (epoll_refcnt_dec(&ep->recnt) == 0) {
+    close(ep->pipes[0]);
+    close(ep->pipes[1]);
     epoll_free(ep);
   }
   return EPOLL_SUCCESS;
@@ -475,6 +475,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
 
     if (ep->closing) {
       epoll_spinlock_unlock(&ep->lock);
+      errno = EBADF;
       result = EPOLL_INVALID;
       goto done;
     }

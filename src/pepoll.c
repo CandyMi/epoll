@@ -170,6 +170,25 @@ void epoll_allocator(epoll_realloc_t realloc_func)
     epoll_realloc = realloc_func;
 }
 
+/* ── epoll_t destructor (call only when refcnt == 0) ────────────── */
+
+static inline void ppoll_ep_free(struct epoll_t *ep)
+{
+    /* Close the self-waking pipe fds — these were left open by
+     * epoll_close so that any concurrent poll() in epoll_wait can
+     * still detect the "x" wake signal on macOS (where close()
+     * of a pipe fd does NOT cause poll() to return POLLNVAL when
+     * other fds are present in the set). */
+    if (ep->pipes[0] >= 0) close(ep->pipes[0]);
+    if (ep->pipes[1] >= 0) close(ep->pipes[1]);
+    epoll_free(ep->entries);
+    epoll_free(ep->pollfds);
+#if EPOLL_USE_SHARED_WORKBUF
+    epoll_free(ep->working);
+#endif
+    epoll_free(ep);
+}
+
 /* ── Internal helpers ──────────────────────────────────────────────── */
 
 /* Drain the self-waking pipe (consume all wake-up bytes). */
@@ -194,13 +213,16 @@ static inline int ppoll_find_slot(const struct epoll_t *ep, SOCKET fd)
 }
 
 /* Grow arrays to `new_cap` elements.
- * Uses epoll_realloc (== realloc semantics) so the allocator may
- * extend in-place — avoiding the malloc+memcpy+free triple of the
- * original design.  On ENOMEM, best-effort rollback is attempted.
- * Returns 0 on success, -1 on ENOMEM.
  *
- * NOTE: caller must ensure new_cap > 0 and that the multiplication
- * in `ep->capacity * 2` didn't overflow (see ppoll_add_locked). */
+ * Uses epoll_malloc + memcpy + epoll_free instead of epoll_realloc
+ * so that callers can safely separate allocation from installation
+ * (alloc outside spinlock, install inside).
+ *
+ * Called from epoll_create1 (single-threaded, safe).
+ * For the concurrent dd path in epoll_ctl, use ppoll_grow_install_locked
+ * with pre-allocated arrays instead.
+ *
+ * Returns 0 on success, -1 on ENOMEM. */
 static inline int ppoll_grow(struct epoll_t *ep, int new_cap)
 {
     if (new_cap > PP_MAX_CAPACITY || new_cap < PP_INITIAL_CAPACITY) {
@@ -212,41 +234,100 @@ static inline int ppoll_grow(struct epoll_t *ep, int new_cap)
     size_t pollfd_sz = (size_t)new_cap * sizeof(struct pollfd);
     int old_cap = ep->capacity;
 
-    /* Realloc entries first */
+    /* Allocate new arrays */
     struct poll_entry *new_entries = (struct poll_entry *)
-        epoll_realloc(ep->entries, entry_sz);
+        epoll_malloc(entry_sz);
     if (!new_entries) {
         errno = ENOMEM;
         return -1;
     }
-    ep->entries = new_entries;
 
-    /* Realloc pollfds — on failure, roll back entries to old size */
     struct pollfd *new_pollfds = (struct pollfd *)
-        epoll_realloc(ep->pollfds, pollfd_sz);
+        epoll_malloc(pollfd_sz);
     if (!new_pollfds) {
-        /* Best-effort rollback: shrink entries back to old_cap.
-         * If this also fails, entries is oversized but still valid. */
-        size_t old_sz = (size_t)old_cap * sizeof(struct poll_entry);
-        struct poll_entry *rolled = (struct poll_entry *)
-            epoll_realloc(ep->entries, old_sz);
-        if (rolled) ep->entries = rolled;
+        epoll_free(new_entries);
         errno = ENOMEM;
         return -1;
     }
-    ep->pollfds = new_pollfds;
 
-    /* Prep new slots to the free list (prepend, reverse-order so
-     * allocation order is old_cap, old_cap+1, …) */
+    /* Copy old data */
+    if (old_cap > 0) {
+        memcpy(new_entries, ep->entries, (size_t)old_cap * sizeof(struct poll_entry));
+        memcpy(new_pollfds, ep->pollfds, (size_t)old_cap * sizeof(struct pollfd));
+    }
+
+    /* Init new slots into free list (prepend, reverse-order) */
     for (int i = new_cap - 1; i >= old_cap; i--) {
-        ep->entries[i].fd = -1;
-        ep->entries[i].epoll_events = ep->free_head;
-        ep->pollfds[i].fd = -1;
+        new_entries[i].fd = -1;
+        new_entries[i].epoll_events = ep->free_head;
+        new_pollfds[i].fd = -1;
         ep->free_head = i;
     }
 
+    /* Swap — only free old arrays when they exist (old_cap > 0).
+     * epoll_free(NULL) via the epoll_realloc macro may create
+     * a minimum-sized allocation on some implementations (glibc)
+     * that would be silently leaked. */
+    if (old_cap > 0) {
+        epoll_free(ep->entries);
+        epoll_free(ep->pollfds);
+    }
+    ep->entries = new_entries;
+    ep->pollfds = new_pollfds;
     ep->capacity = new_cap;
     return 0;
+}
+
+/* Quick check whether the free list is empty.  Returns 0 if a slot is
+ * available, >0 with *out_new_cap set if growth is needed, or a negative
+ * errno value if the instance has hit PP_MAX_CAPACITY.  Caller holds lock. */
+static inline int ppoll_need_grow_locked(const struct epoll_t *ep, int *out_new_cap)
+{
+    if (ep->free_head >= 0 && (uint32_t)ep->free_head < (uint32_t)ep->capacity)
+        return 0;
+
+    if (ep->capacity > PP_MAX_CAPACITY / 2)
+        return -ENOMEM;
+
+    int new_cap = ep->capacity * 2;
+    if (new_cap < PP_INITIAL_CAPACITY)
+        new_cap = PP_INITIAL_CAPACITY;
+    *out_new_cap = new_cap;
+    return 1;
+}
+
+/* Install pre-allocated arrays into ep.  Caller holds the lock.
+ * The old arrays are freed.  new_cap, new_entries, new_pollfds must
+ * all be non-NULL and consistent.  Prepends the new slots to the
+ * free list so they are available for immediate allocation. */
+static inline void ppoll_grow_install_locked(struct epoll_t *ep, int new_cap,
+                                              struct poll_entry *new_entries,
+                                              struct pollfd *new_pollfds)
+{
+    int old_cap = ep->capacity;
+
+    /* Copy old data into new arrays */
+    if (old_cap > 0) {
+        memcpy(new_entries, ep->entries, (size_t)old_cap * sizeof(struct poll_entry));
+        memcpy(new_pollfds, ep->pollfds, (size_t)old_cap * sizeof(struct pollfd));
+    }
+
+    /* Init new slots into free list */
+    for (int i = new_cap - 1; i >= old_cap; i--) {
+        new_entries[i].fd = -1;
+        new_entries[i].epoll_events = ep->free_head;
+        new_pollfds[i].fd = -1;
+        ep->free_head = i;
+    }
+
+    /* Swap — guard free against NULL (see ppoll_grow for rationale) */
+    if (old_cap > 0) {
+        epoll_free(ep->entries);
+        epoll_free(ep->pollfds);
+    }
+    ep->entries = new_entries;
+    ep->pollfds = new_pollfds;
+    ep->capacity = new_cap;
 }
 
 
@@ -318,28 +399,12 @@ static inline int ppoll_add_locked(struct epoll_t *ep, SOCKET fd, struct epoll_e
         return EPOLL_INVALID;
     }
 
-    /* Pop from free list (O(1)) */
+    /* Pop from free list (O(1)) — caller must have ensured free_head
+     * is valid (epoll_ctl pre-grows outside the lock if needed). */
     int slot = ep->free_head;
     if (slot < 0 || (uint32_t)slot >= (uint32_t)ep->capacity) {
-        /* Free list empty — grow.  Keep the lock held so no
-         * concurrent epoll_close can free ep during realloc.
-         * Check for overflow before multiplying. */
-        int new_cap;
-        if (ep->capacity > PP_MAX_CAPACITY / 2) {
-            errno = ENOMEM;
-            return EPOLL_INVALID;
-        }
-        new_cap = ep->capacity * 2;
-        if (new_cap < PP_INITIAL_CAPACITY)
-            new_cap = PP_INITIAL_CAPACITY;
-        if (ppoll_grow(ep, new_cap) != 0)
-            return EPOLL_INVALID;
-
-        slot = ep->free_head;
-        if (slot < 0 || (uint32_t)slot >= (uint32_t)ep->capacity) {
-            errno = ENOMEM;
-            return EPOLL_INVALID;
-        }
+        errno = ENOMEM;
+        return EPOLL_INVALID;
     }
 
     /* Advance the free list before register writes epoll_events */
@@ -401,17 +466,71 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 
     struct epoll_t *ep = (struct epoll_t *)efd;
 
-    /* Take lock FIRST, then check closing — this prevents the
-     * TOCTOU race where epoll_close could free ep between the
-     * closing check and the internal lock acquisition in the
-     * backend functions.  The locked variants assume lock held
-     * and do NOT release it. */
+    /* Hold a reference so concurrent epoll_close cannot free ep
+     * during any unlocked section (needed when growth requires
+     * an allocation that could block the spinlock). */
+    epoll_refcnt_inc(&ep->recnt);
+
     epoll_spinlock_lock(&ep->lock);
 
     int result;
     switch (op)
     {
-        case EPOLL_CTL_ADD: result = ppoll_add_locked(ep, fd, event); break;
+        case EPOLL_CTL_ADD:
+        {
+            /* If the free list is exhausted, pre-allocate memory outside
+             * the lock so the user's allocator (epoll_malloc) is never
+             * called while the spinlock is held. */
+            int new_cap = 0;
+            int grow_needed = ppoll_need_grow_locked(ep, &new_cap);
+            if (grow_needed > 0) {
+                /* ── Unlock, allocate, re-lock, install ── */
+                struct poll_entry *grow_entries =
+                    (struct poll_entry *)epoll_malloc(
+                        (size_t)new_cap * sizeof(struct poll_entry));
+                struct pollfd *grow_pollfds =
+                    (struct pollfd *)epoll_malloc(
+                        (size_t)new_cap * sizeof(struct pollfd));
+                bool grow_ok = (grow_entries != NULL && grow_pollfds != NULL);
+
+                epoll_spinlock_unlock(&ep->lock);
+
+                /* Re-acquire lock */
+                epoll_spinlock_lock(&ep->lock);
+
+                /* Re-check: epoll_close may have run */
+                if (ep->closing) {
+                    epoll_free(grow_entries);
+                    epoll_free(grow_pollfds);
+                    epoll_spinlock_unlock(&ep->lock);
+                    if (epoll_refcnt_dec(&ep->recnt) == 0)
+                        ppoll_ep_free(ep);
+                    errno = EBADF;
+                    return EPOLL_INVALID;
+                }
+
+                if (grow_ok && ppoll_need_grow_locked(ep, &new_cap) > 0) {
+                    /* Still need growth — install our pre-allocated arrays */
+                    ppoll_grow_install_locked(ep, new_cap,
+                                               grow_entries, grow_pollfds);
+                } else {
+                    /* No longer needed or alloc failed — free buffers */
+                    epoll_free(grow_entries);
+                    epoll_free(grow_pollfds);
+                    if (!grow_ok) {
+                        errno = ENOMEM;
+                        result = EPOLL_INVALID;
+                        goto add_done;
+                    }
+                }
+            }
+
+            result = ppoll_add_locked(ep, fd, event);
+            break;
+
+          add_done:
+            break;
+        }
         case EPOLL_CTL_MOD: result = ppoll_mod_locked(ep, fd, event); break;
         case EPOLL_CTL_DEL: result = ppoll_del_locked(ep, fd); break;
         default:
@@ -421,6 +540,8 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
     }
 
     epoll_spinlock_unlock(&ep->lock);
+    if (epoll_refcnt_dec(&ep->recnt) == 0)
+        ppoll_ep_free(ep);
     return result;
 }
 
@@ -440,25 +561,18 @@ int epoll_close(HANDLE efd)
         return EPOLL_INVALID;
     }
     ep->closing = 1;
-    /* Save pipe fds and close after unlock */
-    int p0 = ep->pipes[0], p1 = ep->pipes[1];
-    ep->pipes[0] = ep->pipes[1] = -1;
-    /* Wake any poll() blocked in epoll_wait */
-    write(p1, "x", 1);
+    /* Wake any poll() blocked in epoll_wait.  Do NOT close the pipe
+     * fds here — on macOS, close() of a pipe fd while poll() is
+     * monitoring it does NOT cause poll() to return POLLNVAL when
+     * other valid fds exist in the set.  Instead, the pipe is left
+     * open so the "x" signal remains readable; ppoll_ep_free closes
+     * it when refcnt reaches 0. */
+    write(ep->pipes[1], "x", 1);
     epoll_spinlock_unlock(&ep->lock);
 
-    close(p0);
-    close(p1);
-
     /* drop our reference; last one cleans up */
-    if (epoll_refcnt_dec(&ep->recnt) == 0) {
-        epoll_free(ep->entries);
-        epoll_free(ep->pollfds);
-#if EPOLL_USE_SHARED_WORKBUF
-        epoll_free(ep->working);
-#endif
-        epoll_free(ep);
-    }
+    if (epoll_refcnt_dec(&ep->recnt) == 0)
+        ppoll_ep_free(ep);
     return EPOLL_SUCCESS;
 }
 
@@ -535,6 +649,7 @@ HANDLE epoll_create1(int flags)
 
 int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeout)
 {
+
     errno = 0;
 
     if (efd <= 0) {
@@ -595,6 +710,17 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     {
         /* ── Step 1: drain wake pipe and snapshot pollfds under lock ── */
         epoll_spinlock_lock(&ep->lock);
+
+        /* Check closing before draining or snapshotting — the previous
+         * iteration may have continued via the pipe-wake path and
+         * epoll_close may have set the flag while we were unlocking. */
+        if (ep->closing) {
+            epoll_spinlock_unlock(&ep->lock);
+            errno = EBADF;
+            result = EPOLL_INVALID;
+            goto done;
+        }
+
         ppoll_drain_pipe(ep);
         int nfds = ep->nfds;
 
@@ -730,13 +856,7 @@ done:
 #if !EPOLL_USE_SHARED_WORKBUF
     if (heap) { epoll_free(working); heap = false; working = wstack; }
 #endif
-    if (epoll_refcnt_dec(&ep->recnt) == 0) {
-        epoll_free(ep->entries);
-        epoll_free(ep->pollfds);
-#if EPOLL_USE_SHARED_WORKBUF
-        epoll_free(ep->working);
-#endif
-        epoll_free(ep);
-    }
+    if (epoll_refcnt_dec(&ep->recnt) == 0)
+        ppoll_ep_free(ep);
     return result;
 }

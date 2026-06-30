@@ -19,6 +19,16 @@ if(ENABLE_ASAN)
   endif()
 endif()
 
+option(ENABLE_TSAN "Enable ThreadSanitizer for debugging" OFF)
+if(ENABLE_TSAN)
+  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-fsanitize=thread -g -O1 -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+  else()
+    message(STATUS "TSAN: set -fsanitize=thread in CMAKE_C_FLAGS manually")
+  endif()
+endif()
+
 message("-- Detecting OS: '${CMAKE_SYSTEM_NAME}'")
 
 # ── Backend selection ────────────────────────
@@ -87,7 +97,16 @@ endif()
 add_executable(main test/main.c)
 target_link_libraries(main PRIVATE epoll_static)
 
+# ── Benchmark (POSIX-only: uses pipe/unistd) ─
+if(NOT WIN32)
+  add_executable(bench test/bench.c)
+  target_link_libraries(bench PRIVATE epoll_static)
+endif()
+
 # ── Backend identification for test suite ────
+if(epoll_src STREQUAL "src/epoll.c")
+  target_compile_definitions(main PRIVATE EPOLL_BACKEND_KERNEL=1)
+endif()
 if(epoll_src STREQUAL "src/pepoll.c")
   target_compile_definitions(main PRIVATE EPOLL_BACKEND_POLL=1)
 endif()

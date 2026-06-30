@@ -77,6 +77,47 @@ jobs:
       - run: cmake --build build --config Release
       - run: build\Release\main.exe
 
+  # ── ASAN: Linux (kernel epoll) ───────────────
+  linux-asan-kernel:
+    name: "Linux · GCC · ASAN · kernel epoll"
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_C_COMPILER=gcc -DENABLE_ASAN=ON
+      - run: cmake --build build
+      - run: timeout 120 ./build/main
+
+  # ── ASAN: Linux (pepoll fallback) ────────────
+  linux-asan-pepoll:
+    name: "Linux · GCC · ASAN · poll fallback (pepoll)"
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o build/asan_poll_main -fsanitize=address -g -O1 -fno-omit-frame-pointer
+      - run: timeout 120 ./build/asan_poll_main
+
+  # ── ASAN: macOS (kqueue) ──────────────────────
+  macos-asan-kqueue:
+    name: "macOS · Clang · ASAN · kqueue"
+    timeout-minutes: 5
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S . -B build -DCMAKE_C_COMPILER=clang -DENABLE_ASAN=ON
+      - run: cmake --build build
+      - run: ./build/main
+
+  # ── TSAN: Linux (pepoll fallback) ────────────
+  linux-tsan-pepoll:
+    name: "Linux · GCC · TSAN · poll fallback (pepoll)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p build && gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o build/tsan_poll_main -fsanitize=thread -g -O1 -fno-omit-frame-pointer -lpthread
+      - run: ./build/tsan_poll_main
+
   windows-mingw:
     name: "Windows · MinGW (GCC) · IOCP (wepoll)"
     runs-on: windows-latest
