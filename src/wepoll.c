@@ -548,7 +548,7 @@ int epoll_ctl(HANDLE ephnd, int op, SOCKET sock, struct epoll_event* ev) {
 
   errno = 0;
 
-  if (sock <= (SOCKET)~0)
+  if (sock == INVALID_SOCKET)
     return_set_error(-1, ERROR_INVALID_PARAMETER);
 
   if (op != EPOLL_CTL_DEL && !ev)
