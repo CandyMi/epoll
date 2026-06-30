@@ -91,6 +91,9 @@ target_link_libraries(main PRIVATE epoll_static)
 if(epoll_src STREQUAL "src/pepoll.c")
   target_compile_definitions(main PRIVATE EPOLL_BACKEND_POLL=1)
 endif()
+if(epoll_src STREQUAL "src/uepoll.c")
+  target_compile_definitions(main PRIVATE EPOLL_BACKEND_SELECT=1)
+endif()
 
 # ── Install ──────────────────────────────────
 include(GNUInstallDirs)

@@ -326,7 +326,7 @@ int epoll_ctl(HANDLE efd, int op, SOCKET fd, struct epoll_event *event)
 int epoll_close(HANDLE efd)
 {
   if (efd <= 0) {
-    errno = EBADF; // 指针不会为负数.
+    errno = EBADF; // efd <= 0 is always invalid (HANDLE is intptr_t)
     return EPOLL_INVALID;
   }
 
@@ -380,7 +380,7 @@ HANDLE epoll_create1(int flags)
   memset(ep, 0, sizeof(struct epoll_t));
   ep->pipes[0] = ep->pipes[1] = -1;
   if (pipe(ep->pipes)) {
-    epoll_close((HANDLE)ep);
+    epoll_free(ep);
     return -1;
   }
   if (flags & EPOLL_CLOEXEC) {
@@ -389,7 +389,7 @@ HANDLE epoll_create1(int flags)
   }
   epoll_nonblock(ep->pipes[0]);
   epoll_nonblock(ep->pipes[1]);
-  /* 初始化 */
+  /* zero-initialize remaining state */
   ep->nfds = 0;
   ep->edited = false;
   FD_ZERO(&ep->rset);
@@ -397,7 +397,7 @@ HANDLE epoll_create1(int flags)
   FD_ZERO(&ep->eset);
   epoll_spinlock_init(&ep->lock);
   epoll_refcnt_init(&ep->recnt, 1);
-  for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i]._nouse = 1; // 表示未使用fd.
+  for (int i = 0; i < EPOLL_MAX_EVENTS; i++) ep->udata[i]._nouse = 1; // mark all slots as unused
   struct epoll_event ev; ev.data.ptr = 0; ev.events = EPOLLIN; ev._nouse =1;
   uepoll_add(ep, ep->pipes[0], &ev);
   return (HANDLE)ep;

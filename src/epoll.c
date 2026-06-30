@@ -17,7 +17,7 @@
 
 void epoll_allocator(epoll_realloc_t alloc)
 {
-  (void)alloc; /* 只做兼容 */
+  (void)alloc; /* no-op on Linux — kernel epoll does no user-space allocation */
 }
 
 int epoll_close(HANDLE efd)

@@ -110,8 +110,6 @@ static inline bool ppoll_can_poll(SOCKET fd)
         || S_ISCHR(st.st_mode) || S_ISREG(st.st_mode);
 }
 
-#define epoll_nonexec(fd)   fcntl(fd, F_SETFD, FD_CLOEXEC | fcntl(fd, F_GETFD))
-#define epoll_nonblock(fd)  fcntl(fd, F_SETFL, O_NONBLOCK | fcntl(fd, F_GETFL))
 
 /* ── Per-entry data ────────────────────────────────────────────────── */
 

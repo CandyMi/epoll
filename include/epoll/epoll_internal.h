@@ -180,7 +180,7 @@
 
 #elif defined(EPOLL_NO_THREADS)
   /* Single-threaded: plain volatile int. */
-  typedef volatile int epoll_refcnt_t;
+  typedef volatile sig_atomic_t epoll_refcnt_t;
   #define epoll_refcnt_init(r, v)  ((void)(*(r) = (v)))
   #define epoll_refcnt_inc(r)      (++*(r))
   #define epoll_refcnt_dec(r)      (--*(r))

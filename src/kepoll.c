@@ -274,7 +274,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   if (maxevents > EPOLL_MAX_EVENTS)
     maxevents = EPOLL_MAX_EVENTS;
 
-  /* 兼容两者的时间行为 */
+  /* convert ms to timespec; supports -1 (infinite) and 0 (poll) */
   struct timespec ts; struct timespec *tsp = NULL;
   if (timeout >= 0) {
     tsp = &ts;
