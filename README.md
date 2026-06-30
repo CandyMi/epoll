@@ -120,7 +120,7 @@ gcc -DNO_NATIVE_EPOLL=1 -I include/epoll src/pepoll.c test/main.c -o main
 
 ```mermaid
 flowchart TD
-    User["User Code"] -- #include "epoll.h" --> epoll_h["epoll.h (Dispatch)"]
+    User["User Code"] -- "#include 'epoll.h'" --> epoll_h["epoll.h (Dispatch)"]
     epoll_h -- "__linux__ / __ANDROID__" --> linux["epoll.c\nKernel epoll"]
     epoll_h -- "WIN32" --> win["wepoll.c\nIOCP + NT API"]
     epoll_h -- "other" --> uepoll_h

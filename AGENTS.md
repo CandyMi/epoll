@@ -11,7 +11,7 @@ This is a **Linux epoll ABI compatibility layer** for cross-platform event-drive
 
 ```mermaid
 flowchart TD
-    User["User Code"] -- #include "epoll.h" --> epoll_h["epoll.h (Dispatch)"]
+    User["User Code"] -- "#include 'epoll.h'" --> epoll_h["epoll.h (Dispatch)"]
     epoll_h -- "__linux__ / __ANDROID__\n(NO_NATIVE_EPOLL=0)" --> linux["epoll.c\nKernel epoll"]
     epoll_h -- "Linux + -DNO_NATIVE_EPOLL=1" --> uepoll_h
     epoll_h -- WIN32 --> win["wepoll.c\nIOCP + NT API"]
