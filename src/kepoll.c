@@ -308,6 +308,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
   struct kevent  kstack[EPOLL_STACK_NFDS];
   struct kevent *kqevents = kstack;
   bool           heap     = false;
+  int64_t        wait_start = 0;
   if (maxevents > EPOLL_STACK_NFDS) {
     kqevents = (struct kevent *)epoll_malloc((size_t)maxevents * sizeof(struct kevent));
     if (!kqevents) { errno = ENOMEM; return EPOLL_INVALID; }
@@ -330,6 +331,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     epoll_spinlock_unlock(&ep->lock);
 
     struct epoll_event *ev;
+    wait_start = epoll_timeout_start();
     int nevents = kevent(local_efd, NULL, 0, kqevents, maxevents, tsp);
 
     /* Re-acquire lock to check closing and process events — merged
@@ -349,10 +351,8 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     if (nevents < 0) {
       if (errno == EINTR) {
         epoll_spinlock_unlock(&ep->lock);
+        epoll_timeout_decay(&timeout, wait_start);
         if (timeout > 0) {
-          /* Approximate decay: kevent timeout is relative, just retry */
-          timeout -= 100;
-          if (timeout < 0) timeout = 0;
           tsp->tv_nsec = (timeout % 1000) * 1000000;
           tsp->tv_sec  = (timeout - timeout % 1000) / 1000;
         }

@@ -443,10 +443,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     if (r < 0) {
       if (errno == EINTR) {
         epoll_spinlock_unlock(&ep->lock);
-        if (timeout > 0) {
-          timeout -= (epoll_now_ms() - wait_time);
-          if (timeout < 0) timeout = 0;
-        }
+        epoll_timeout_decay(&timeout, wait_time);
         continue;
       }
       epoll_spinlock_unlock(&ep->lock);
@@ -458,10 +455,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
     if (r > 0)
     {
       if (FD_ISSET(ep->pipes[0], &rset)) {
-        if (timeout > 0) {
-          timeout -= (epoll_now_ms() - wait_time);
-          if (timeout < 0) timeout = 0;
-        }
+        epoll_timeout_decay(&timeout, wait_time);
         epoll_spinlock_unlock(&ep->lock);
         continue;
       }

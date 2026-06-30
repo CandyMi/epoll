@@ -635,13 +635,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             epoll_spinlock_unlock(&ep->lock);
             /* EINTR is the only recoverable error — retry with decay. */
             if (errno == EINTR) {
-                if (timeout > 0) {
-                    int64_t elapsed = epoll_now_ms() - poll_start;
-                    if (elapsed > 0) {
-                        timeout -= (int)elapsed;
-                        if (timeout < 0) timeout = 0;
-                    }
-                }
+                epoll_timeout_decay(&timeout, poll_start);
                 continue;
             }
             goto out;
@@ -661,13 +655,7 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
             /* Another thread modified the set — drain and restart.
              * Decay remaining timeout if applicable. */
             epoll_spinlock_unlock(&ep->lock);
-            if (timeout > 0) {
-                int64_t elapsed = epoll_now_ms() - poll_start;
-                if (elapsed > 0) {
-                    timeout -= (int)elapsed;
-                    if (timeout < 0) timeout = 0;
-                }
-            }
+            epoll_timeout_decay(&timeout, poll_start);
             continue;
         }
 

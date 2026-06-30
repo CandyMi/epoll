@@ -182,4 +182,37 @@ static inline int64_t epoll_now_ms(void)
 #endif
 }
 
+/* ==================================================================
+ *  7.  EINTR / pipe-wake timeout decay helpers
+ *
+ *  Shared by kepoll.c, pepoll.c, and uepoll.c.  Eliminates the
+ *  3-way copy of the same elapsed-time calculation pattern.
+ *
+ *  Usage:
+ *    int64_t t0 = epoll_timeout_start();
+ *    int r = poll(...);
+ *    if (r < 0 && errno == EINTR)
+ *        epoll_timeout_decay(&timeout, t0);
+ * ================================================================== */
+
+/* Record the start timestamp before a blocking system call.
+ * Call right before kevent/poll/select, not before the lock acquire. */
+static inline int64_t epoll_timeout_start(void)
+{
+    return epoll_now_ms();
+}
+
+/* Decay `*timeout_ms` by the wall-clock time elapsed since `start_ms`.
+ * Clamps to 0.  Safe to call when *timeout_ms <= 0 (no-op). */
+static inline void epoll_timeout_decay(int *timeout_ms, int64_t start_ms)
+{
+    if (*timeout_ms > 0) {
+        int64_t elapsed = epoll_now_ms() - start_ms;
+        if (elapsed > 0) {
+            *timeout_ms -= (int)elapsed;
+            if (*timeout_ms < 0) *timeout_ms = 0;
+        }
+    }
+}
+
 #endif /* EPOLL_INTERNAL_H */
