@@ -120,13 +120,12 @@
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
   /* Single-threaded: all locking is a no-op. */
-  typedef int epoll_lock_t;
+  typedef sig_atomic_t epoll_lock_t;
   #define epoll_spinlock_init(lock)       ((void)(lock))
   #define epoll_spinlock_lock(lock)       ((void)(lock))
   #define epoll_spinlock_unlock(lock)     ((void)(lock))
 
-#elif defined(EPOLL_USE_ATOMIC) || \
-  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
+#elif defined(EPOLL_USE_ATOMIC)
   /* C11 <stdatomic.h> — the preferred path. */
   #include <stdatomic.h>
   typedef atomic_flag epoll_lock_t;
@@ -134,9 +133,7 @@
   #define epoll_spinlock_lock(lock)       do {} while (atomic_flag_test_and_set_explicit((lock), memory_order_acquire))
   #define epoll_spinlock_unlock(lock)     atomic_flag_clear_explicit((lock), memory_order_release)
 
-#elif defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_1) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_2) \
-   || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) \
+#elif defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_4) \
    || defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
   /* GCC legacy __sync_* builtins (pre-C11 compilers). */
   typedef int epoll_lock_t;
@@ -163,8 +160,14 @@
  *  Rationale: checking "== 0" after dec reads naturally as "is zero".
  * ================================================================== */
 
-#if defined(EPOLL_USE_ATOMIC) || \
-  (defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_ATOMICS__))
+#if defined(EPOLL_NO_THREADS)
+  /* Single-threaded: plain volatile int. */
+  typedef volatile sig_atomic_t epoll_refcnt_t;
+  #define epoll_refcnt_init(r, v)  ((void)(*(r) = (v)))
+  #define epoll_refcnt_inc(r)      (++*(r))
+  #define epoll_refcnt_dec(r)      (--*(r))
+
+#elif defined(EPOLL_USE_ATOMIC)
   /* C11 <stdatomic.h> — included above by the spinlock section. */
   typedef atomic_int epoll_refcnt_t;
   #define epoll_refcnt_init(r, v)  atomic_init(r, v)
@@ -179,14 +182,8 @@
   #define epoll_refcnt_inc(r)      __sync_add_and_fetch(r, 1)
   #define epoll_refcnt_dec(r)      __sync_sub_and_fetch(r, 1)
 
-#elif defined(EPOLL_NO_THREADS)
-  /* Single-threaded: plain volatile int. */
-  typedef volatile sig_atomic_t epoll_refcnt_t;
-  #define epoll_refcnt_init(r, v)  ((void)(*(r) = (v)))
-  #define epoll_refcnt_inc(r)      (++*(r))
-  #define epoll_refcnt_dec(r)      (--*(r))
 #else
-  #error "epoll internal: no atomic operations available for refcount."
+  #error "epoll internal: no atomic operations available.  Define EPOLL_NO_THREADS if single-threaded."
 #endif
 
 /* ==================================================================
