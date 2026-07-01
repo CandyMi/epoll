@@ -375,10 +375,10 @@ int epoll_wait(HANDLE efd, struct epoll_event *events, int maxevents, int timeou
           if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
           if (kqevents[i].filter == EVFILT_WRITE) ev->events |= EPOLLOUT;
           ev->data.ptr = kqevents[i].udata;
-          kepoll_del_locked(ep, kqevents[i].ident, false);
+          kepoll_del_locked(ep, (SOCKET)kqevents[i].ident, false);
           continue;
         } else if (flags & EV_ERROR || flags & EV_EOF) {
-          kepoll_del_locked(ep, kqevents[i].ident, false);
+          kepoll_del_locked(ep, (SOCKET)kqevents[i].ident, false);
           if (flags & EV_ERROR) ev->events |= EPOLLERR;
           if (flags & EV_EOF)   ev->events |= EPOLLHUP;
           if (kqevents[i].filter == EVFILT_READ) ev->events |= EPOLLIN;
