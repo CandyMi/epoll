@@ -120,6 +120,7 @@
 // #define EPOLL_NO_THREADS 1
 #if defined(EPOLL_NO_THREADS)
   /* Single-threaded: all locking is a no-op. */
+  #include <signal.h>
   typedef sig_atomic_t epoll_lock_t;
   #define epoll_spinlock_init(lock)       ((void)(lock))
   #define epoll_spinlock_lock(lock)       ((void)(lock))
